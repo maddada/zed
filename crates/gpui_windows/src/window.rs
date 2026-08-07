@@ -445,6 +445,12 @@ impl WindowsWindow {
         } else {
             None
         };
+        let native_owner_hwnd = if params.kind == WindowKind::PopUp {
+            let owner_window = unsafe { GetActiveWindow() };
+            (!owner_window.is_invalid()).then_some(owner_window)
+        } else {
+            parent_hwnd
+        };
         let hide_title_bar = params
             .titlebar
             .as_ref()
@@ -460,7 +466,11 @@ impl WindowsWindow {
         );
 
         let (mut dwexstyle, dwstyle) = if params.kind == WindowKind::PopUp {
-            (WS_EX_TOOLWINDOW, WINDOW_STYLE(0x0))
+            let mut dwexstyle = WS_EX_TOOLWINDOW;
+            if !params.focus {
+                dwexstyle |= WS_EX_NOACTIVATE;
+            }
+            (dwexstyle, WS_POPUP)
         } else {
             let mut dwstyle = WS_SYSMENU;
 
@@ -525,7 +535,7 @@ impl WindowsWindow {
                 CW_USEDEFAULT,
                 CW_USEDEFAULT,
                 CW_USEDEFAULT,
-                parent_hwnd,
+                native_owner_hwnd,
                 None,
                 Some(hinstance.into()),
                 Some(&context as *const _ as *const _),
@@ -542,13 +552,16 @@ impl WindowsWindow {
         set_non_rude_hwnd(hwnd, true);
         configure_dwm_dark_mode(hwnd, appearance);
         this.state.border_offset.update(hwnd)?;
-        let placement = retrieve_window_placement(
+        let mut placement = retrieve_window_placement(
             hwnd,
             display,
             params.bounds,
             this.state.scale_factor.get(),
             &this.state.border_offset,
         )?;
+        if params.kind == WindowKind::PopUp && !params.focus {
+            placement.showCmd = SW_SHOWNOACTIVATE.0 as u32;
+        }
         if params.show {
             unsafe { SetWindowPlacement(hwnd, &placement)? };
         } else {
