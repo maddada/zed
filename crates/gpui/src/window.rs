@@ -1699,7 +1699,12 @@ impl Window {
             platform_window.set_app_id(&app_id);
         }
 
-        platform_window.map_window().unwrap();
+        // CDXC:PlatformSupport 2026-09-11 WHY:
+        // Mapping an X11 window makes it visible even when it was created with show=false, so hidden popup preloads must wait for explicit activation.
+        // SEE-ALSO: gpui_linux/src/linux/x11/window.rs (activate maps a hidden window).
+        if show {
+            platform_window.map_window()?;
+        }
 
         Ok(Window {
             handle,
@@ -3963,7 +3968,11 @@ impl Window {
         );
         let integer_origin = quantized_origin.map(|c| ScaledPixels(c.trunc()));
         let subpixel_rendering = self.should_use_subpixel_rendering(font_id, font_size);
-        let dilation = self.text_system().glyph_dilation_for_color(color);
+        let dilation = if self.text_style().font_smoothing {
+            self.text_system().glyph_dilation_for_color(color)
+        } else {
+            0
+        };
         let params = RenderGlyphParams {
             font_id,
             glyph_id,
