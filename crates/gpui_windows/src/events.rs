@@ -61,7 +61,7 @@ impl WindowsWindowInner {
             WM_CLOSE => self.handle_close_msg(),
             WM_DESTROY => self.handle_destroy_msg(handle),
             WM_MOUSEMOVE => self.handle_mouse_move_msg(handle, lparam, wparam),
-            WM_MOUSELEAVE | WM_NCMOUSELEAVE => self.handle_mouse_leave_msg(),
+            WM_MOUSELEAVE | WM_NCMOUSELEAVE => self.handle_mouse_leave_msg(handle),
             WM_NCMOUSEMOVE => self.handle_nc_mouse_move_msg(handle, lparam),
             // Treat double click as a second single click, since we track the double clicks ourselves.
             // If you don't interact with any elements, this will fall through to the windows default
@@ -330,7 +330,10 @@ impl WindowsWindowInner {
         if handled { Some(0) } else { Some(1) }
     }
 
-    fn handle_mouse_leave_msg(&self) -> Option<isize> {
+    /// CDXC:PlatformSupport 2026-09-13 WHY:
+    /// Moving from a GPUI resize rail into a CEF child HWND ends mouse tracking without another GPUI mouse move.
+    /// The window hover flag only redraws; element hover listeners need MouseExited to clear their delayed highlight.
+    fn handle_mouse_leave_msg(&self, handle: HWND) -> Option<isize> {
         self.state.hovered.set(false);
         // The next window's `WM_SETCURSOR` picks its own cursor, so we just clear
         // the flag for tight `is_cursor_visible()` semantics.
@@ -341,6 +344,44 @@ impl WindowsWindowInner {
                 .callbacks
                 .hovered_status_change
                 .set(Some(callback));
+        }
+
+        let mut position = POINT::default();
+        unsafe {
+            GetCursorPos(&mut position)
+                .context("unable to get mouse exit position")
+                .log_err()?;
+            ScreenToClient(handle, &mut position)
+                .ok()
+                .context("unable to convert mouse exit position")
+                .log_err()?;
+        }
+        if let Some(mut callback) = self.state.callbacks.input.take() {
+            let pressed_button = [
+                (VK_LBUTTON, MouseButton::Left),
+                (VK_RBUTTON, MouseButton::Right),
+                (VK_MBUTTON, MouseButton::Middle),
+                (
+                    VK_XBUTTON1,
+                    MouseButton::Navigate(NavigationDirection::Back),
+                ),
+                (
+                    VK_XBUTTON2,
+                    MouseButton::Navigate(NavigationDirection::Forward),
+                ),
+            ]
+            .into_iter()
+            .find_map(|(key, button)| is_virtual_key_pressed(key).then_some(button));
+            callback(PlatformInput::MouseExited(MouseExitEvent {
+                position: logical_point(
+                    position.x as f32,
+                    position.y as f32,
+                    self.state.scale_factor.get(),
+                ),
+                pressed_button,
+                modifiers: current_modifiers(),
+            }));
+            self.state.callbacks.input.set(Some(callback));
         }
 
         Some(0)
