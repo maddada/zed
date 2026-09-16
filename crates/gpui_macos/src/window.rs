@@ -1167,11 +1167,16 @@ impl MacWindow {
 }
 
 impl Drop for MacWindow {
+    /// CDXC:PlatformSupport 2026-09-16 WHY:
+    /// AccessKit retains the content view, whose GPUI child retains this window state, so leaving the adapter in the state creates a cycle.
+    /// After a popup closes, stale accessibility frame queries then reach a detached view and panic in AccessKit's window lookup.
+    /// Drop the adapter outside the state lock and before closing the native window so its accessibility nodes are invalidated while the view is still attached.
     fn drop(&mut self) {
         let mut this = self.0.lock();
         this.renderer.destroy();
         let window = this.native_window;
         let sheet_parent = this.sheet_parent.take();
+        let accesskit_adapter = this.accesskit_adapter.take();
         this.frame_source.take();
         unsafe {
             this.native_window.setDelegate_(nil);
@@ -1179,6 +1184,7 @@ impl Drop for MacWindow {
         this.input_handler.take();
         this.foreground_executor
             .spawn(async move {
+                drop(accesskit_adapter);
                 unsafe {
                     if let Some(parent) = sheet_parent {
                         let _: () = msg_send![parent, endSheet: window];
