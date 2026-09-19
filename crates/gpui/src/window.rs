@@ -4666,8 +4666,13 @@ impl Window {
             PlatformInput::MousePressure(mouse_pressure) => {
                 PlatformInput::MousePressure(mouse_pressure)
             }
+            // CDXC:PlatformSupport 2026-09-19 WHY:
+            // Moving from a GPUI element into a native child view (macOS NSView, Windows child HWND) ends mouse tracking without another mouse move, so the hit test stayed on the element last under the pointer and its `.hover()` style never cleared.
+            // Every platform fills `position` with where the pointer left, so the window follows it and redraws like the pointer had moved there.
             PlatformInput::MouseExited(mouse_exited) => {
+                self.mouse_position = mouse_exited.position;
                 self.modifiers = mouse_exited.modifiers;
+                self.refresh();
                 PlatformInput::MouseExited(mouse_exited)
             }
             PlatformInput::ModifiersChanged(modifiers_changed) => {
