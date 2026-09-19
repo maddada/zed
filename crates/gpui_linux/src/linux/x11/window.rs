@@ -58,6 +58,7 @@ x11rb::atom_manager! {
         WM_DELETE_WINDOW,
         WM_CHANGE_STATE,
         WM_TRANSIENT_FOR,
+        _GPUI_KEYBOARD_FOCUS_WINDOW,
         _NET_WM_PID,
         _NET_WM_NAME,
         _NET_WM_ICON,
@@ -256,6 +257,7 @@ pub struct Callbacks {
 
 pub struct X11WindowState {
     pub destroyed: bool,
+    pub(crate) keyboard_focus_window: xproto::Window,
     parent: Option<X11WindowStatePtr>,
     children: FxHashSet<xproto::Window>,
     client: X11ClientStatePtr,
@@ -517,6 +519,45 @@ impl X11WindowState {
 
         // Collect errors during setup, so that window can be destroyed on failure.
         let setup_result = maybe!({
+            // CDXC:FocusRouting 2026-09-18 WHY:
+            // Focusing the toplevel lets X11 send keys to embedded Chromium under the pointer; a leaf focus window prevents that redirection.
+            // GPUI must select and dispatch keys on the leaf itself because keyboard events do not propagate above the X focus window.
+            // SEE-ALSO: client.rs maps this child to its owning window; Ghostex's apps/desktop/src/cef/linux_x11.rs reads the property for native handoffs.
+            let keyboard_focus_window = xcb.generate_id()?;
+            check_reply(
+                || "X11 keyboard-focus window creation failed.",
+                xcb.create_window(
+                    0,
+                    keyboard_focus_window,
+                    x_window,
+                    -1,
+                    -1,
+                    1,
+                    1,
+                    0,
+                    xproto::WindowClass::INPUT_ONLY,
+                    x11rb::COPY_FROM_PARENT,
+                    &xproto::CreateWindowAux::new().event_mask(
+                        xproto::EventMask::KEY_PRESS
+                            | xproto::EventMask::KEY_RELEASE
+                            | xproto::EventMask::FOCUS_CHANGE,
+                    ),
+                ),
+            )?;
+            check_reply(
+                || "X11 keyboard-focus window mapping failed.",
+                xcb.map_window(keyboard_focus_window),
+            )?;
+            check_reply(
+                || "X11 keyboard-focus window property failed.",
+                xcb.change_property32(
+                    xproto::PropMode::REPLACE,
+                    x_window,
+                    atoms._GPUI_KEYBOARD_FOCUS_WINDOW,
+                    xproto::AtomEnum::WINDOW,
+                    &[keyboard_focus_window],
+                ),
+            )?;
             let pid = std::process::id();
             check_reply(
                 || "X11 ChangeProperty for _NET_WM_PID failed.",
@@ -781,6 +822,7 @@ impl X11WindowState {
 
             Ok(Self {
                 parent,
+                keyboard_focus_window,
                 children: FxHashSet::default(),
                 client,
                 executor,
@@ -1497,7 +1539,7 @@ impl PlatformWindow for X11Window {
             .xcb
             .set_input_focus(
                 xproto::InputFocus::POINTER_ROOT,
-                self.0.x_window,
+                self.0.state.borrow().keyboard_focus_window,
                 xproto::Time::CURRENT_TIME,
             )
             .log_err();
