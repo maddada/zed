@@ -1475,15 +1475,25 @@ impl Window {
                     .update(&mut cx, |_, _, cx| cx.thermal_state())
                     .log_err();
 
+                // CDXC:Sidebar 2026-09-19 WHY:
+                // The high-rate input sustain below only ran for the active window, so scrolling a
+                // window that had lost key status to another app's panel presented a frame per
+                // scroll event and nothing in between; a ProMotion panel then settled at its idle
+                // refresh and the display link paced the scroll at that rate, which read as a
+                // few frames per second. Input arriving at a high rate keeps presentation and the
+                // full frame rate whether or not the window is key; the inactive cap still applies
+                // once the input stops.
+                let high_rate_input = input_rate_tracker.borrow_mut().is_high_rate();
+
                 // Throttle frame rate based on conditions:
                 // - Thermal pressure (Serious/Critical): cap to ~60fps
-                // - Inactive window (not focused): cap to ~30fps to save energy
+                // - Inactive window (not focused) without high-rate input: cap to ~30fps to save energy
                 let min_frame_interval = if !request_frame_options.force_render
                     && !request_frame_options.require_presentation
                     && next_frame_callbacks.borrow().is_empty()
                 {
                     None
-                } else if !active.get() {
+                } else if !active.get() && !high_rate_input {
                     Some(Duration::from_micros(33333))
                 } else if let Some(ThermalState::Critical | ThermalState::Serious) = thermal_state {
                     Some(Duration::from_micros(16667))
@@ -1524,7 +1534,7 @@ impl Window {
                 // to prevent display underclocking during active input.
                 let needs_present = request_frame_options.require_presentation
                     || needs_present.get()
-                    || (active.get() && input_rate_tracker.borrow_mut().is_high_rate());
+                    || high_rate_input;
 
                 if invalidator.is_dirty() || request_frame_options.force_render {
                     measure("frame duration", || {
