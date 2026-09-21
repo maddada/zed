@@ -315,6 +315,8 @@ impl Platform for WebPlatform {
             CursorStyle::DragLink => "alias",
             CursorStyle::DragCopy => "copy",
             CursorStyle::ContextualMenu => "context-menu",
+            CursorStyle::ZoomIn => "zoom-in",
+            CursorStyle::ZoomOut => "zoom-out",
         };
 
         self.last_cursor_css.set(css_cursor);

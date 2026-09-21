@@ -2137,6 +2137,14 @@ pub enum CursorStyle {
     /// A cursor indicating that the operation will result in a context menu
     /// corresponds to the CSS cursor value `context-menu`
     ContextualMenu,
+
+    /// A cursor indicating that clicking will zoom in
+    /// corresponds to the CSS cursor value `zoom-in`
+    ZoomIn,
+
+    /// A cursor indicating that clicking will zoom out
+    /// corresponds to the CSS cursor value `zoom-out`
+    ZoomOut,
 }
 
 /// A clipboard item that should be copied to the clipboard
