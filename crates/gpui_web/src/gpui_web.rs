@@ -1,5 +1,6 @@
 #![cfg(target_family = "wasm")]
 
+mod a11y;
 mod dispatcher;
 mod display;
 mod events;

@@ -16,6 +16,33 @@ pub struct WebEventListeners {
     closures: Vec<Closure<dyn FnMut(JsValue)>>,
 }
 
+impl WebEventListeners {
+    /// Removes the listeners that were registered on the document and on the colour-scheme query rather than on the window's own
+    /// elements, which go away with the elements. Removing one that was never added is a no-op.
+    pub(crate) fn detach_from(&self, browser_window: &web_sys::Window) {
+        let Some(document) = browser_window.document() else {
+            return;
+        };
+        let color_scheme = browser_window
+            .match_media("(prefers-color-scheme: dark)")
+            .ok()
+            .flatten();
+        for closure in &self.closures {
+            if let Some(color_scheme) = &color_scheme {
+                color_scheme
+                    .remove_event_listener_with_callback("change", closure.as_ref().unchecked_ref())
+                    .ok();
+            }
+            document
+                .remove_event_listener_with_callback(
+                    "visibilitychange",
+                    closure.as_ref().unchecked_ref(),
+                )
+                .ok();
+        }
+    }
+}
+
 pub(crate) struct ClickState {
     last_position: Point<Pixels>,
     last_time: f64,
@@ -448,6 +475,63 @@ impl WebWindowInner {
             let Some(clipboard_data) = event.clipboard_data() else {
                 return;
             };
+            // Pasted images arrive as files, and a file's bytes can only be read asynchronously,
+            // while apps read the clipboard synchronously from their paste action. So the bytes
+            // are read first, parked where `Platform::read_from_clipboard` finds them, and the
+            // paste shortcut is dispatched again: the app's own paste handler then runs as it
+            // does on a desktop platform, with an image on the clipboard.
+            let images: Vec<web_sys::File> = clipboard_data
+                .files()
+                .map(|files| {
+                    (0..files.length())
+                        .filter_map(|index| files.get(index))
+                        .filter(|file| gpui::ImageFormat::from_mime_type(&file.type_()).is_some())
+                        .collect()
+                })
+                .unwrap_or_default();
+            if !images.is_empty() {
+                event.prevent_default();
+                let this = Rc::clone(&this);
+                wasm_bindgen_futures::spawn_local(async move {
+                    let mut entries = Vec::new();
+                    for file in images {
+                        let Some(format) = gpui::ImageFormat::from_mime_type(&file.type_()) else {
+                            continue;
+                        };
+                        let Ok(buffer) =
+                            wasm_bindgen_futures::JsFuture::from(file.array_buffer()).await
+                        else {
+                            continue;
+                        };
+                        let bytes = js_sys::Uint8Array::new(&buffer).to_vec();
+                        entries.push(gpui::ClipboardEntry::Image(gpui::Image::from_bytes(
+                            format, bytes,
+                        )));
+                    }
+                    if entries.is_empty() {
+                        return;
+                    }
+                    crate::platform::set_pasted_clipboard(Some(gpui::ClipboardItem { entries }));
+                    // Key bindings are chosen by the COMPILE target, and wasm is not macOS, so an
+                    // app built for the web binds paste to ctrl-v whatever computer the page is on.
+                    let modifiers = Modifiers {
+                        control: true,
+                        ..Modifiers::default()
+                    };
+                    this.dispatch_input(PlatformInput::KeyDown(KeyDownEvent {
+                        keystroke: Keystroke {
+                            modifiers,
+                            key: "v".to_string(),
+                            key_char: None,
+                        },
+                        is_held: false,
+                        prefer_character_input: false,
+                    }));
+                    crate::platform::set_pasted_clipboard(None);
+                });
+                return;
+            }
+
             let Ok(text) = clipboard_data.get_data("text/plain") else {
                 return;
             };
@@ -502,7 +586,12 @@ impl WebWindowInner {
                 let mut state = this.state.borrow_mut();
                 state.is_active = true;
             }
-            let mut callbacks = this.callbacks.borrow_mut();
+            // Focus moves synchronously (opening a second window focuses its input, which blurs
+            // this one) and can land while another handler of this window holds the callbacks.
+            // The status itself is already recorded above; the notification is skipped.
+            let Ok(mut callbacks) = this.callbacks.try_borrow_mut() else {
+                return;
+            };
             if let Some(ref mut callback) = callbacks.active_status_change {
                 callback(true);
             }
@@ -516,7 +605,12 @@ impl WebWindowInner {
                 let mut state = this.state.borrow_mut();
                 state.is_active = false;
             }
-            let mut callbacks = this.callbacks.borrow_mut();
+            // Focus moves synchronously (opening a second window focuses its input, which blurs
+            // this one) and can land while another handler of this window holds the callbacks.
+            // The status itself is already recorded above; the notification is skipped.
+            let Ok(mut callbacks) = this.callbacks.try_borrow_mut() else {
+                return;
+            };
             if let Some(ref mut callback) = callbacks.active_status_change {
                 callback(false);
             }
@@ -530,7 +624,9 @@ impl WebWindowInner {
                 let mut state = this.state.borrow_mut();
                 state.is_hovered = true;
             }
-            let mut callbacks = this.callbacks.borrow_mut();
+            let Ok(mut callbacks) = this.callbacks.try_borrow_mut() else {
+                return;
+            };
             if let Some(ref mut callback) = callbacks.hover_status_change {
                 callback(true);
             }
@@ -544,7 +640,9 @@ impl WebWindowInner {
                 let mut state = this.state.borrow_mut();
                 state.is_hovered = false;
             }
-            let mut callbacks = this.callbacks.borrow_mut();
+            let Ok(mut callbacks) = this.callbacks.try_borrow_mut() else {
+                return;
+            };
             if let Some(ref mut callback) = callbacks.hover_status_change {
                 callback(false);
             }

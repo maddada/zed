@@ -57,10 +57,13 @@ pub(crate) struct WebWindowInner {
     pub(crate) is_composing: Cell<bool>,
     mql_handle: RefCell<Option<MqlHandle>>,
     pending_physical_size: Cell<Option<(u32, u32)>>,
+    /// The pending animation frame, cancelled when the window closes so it never fires into a dropped closure.
+    raf_id: Cell<Option<i32>>,
 }
 
 pub struct WebWindow {
     inner: Rc<WebWindowInner>,
+    a11y: RefCell<Option<Rc<RefCell<crate::a11y::WebA11y>>>>,
     display: Rc<dyn PlatformDisplay>,
     #[allow(dead_code)]
     handle: AnyWindowHandle,
@@ -73,7 +76,7 @@ pub struct WebWindow {
 impl WebWindow {
     pub fn new(
         handle: AnyWindowHandle,
-        _params: WindowParams,
+        params: WindowParams,
         context: &WgpuContext,
         browser_window: web_sys::Window,
     ) -> anyhow::Result<Self> {
@@ -93,13 +96,43 @@ impl WebWindow {
 
         canvas.set_tab_index(-1);
 
+        // The first window is the page itself and fills it. Every later window (an app's menus,
+        // pickers and dialogs, which are real child windows on the desktop platforms) is an
+        // overlay canvas of the same page, placed at the bounds it asked for in the first
+        // window's coordinates, which are also the page's.
+        let is_child = document
+            .query_selector("canvas[data-gpui-window]")
+            .ok()
+            .flatten()
+            .is_some();
+        canvas.set_attribute("data-gpui-window", "").ok();
+
         let style = canvas.style();
-        style
-            .set_property("width", "100%")
-            .map_err(|e| anyhow::anyhow!("Failed to set canvas width style: {e:?}"))?;
-        style
-            .set_property("height", "100%")
-            .map_err(|e| anyhow::anyhow!("Failed to set canvas height style: {e:?}"))?;
+        if is_child {
+            let bounds = params.bounds;
+            style.set_property("position", "fixed").ok();
+            style.set_property("z-index", "1000").ok();
+            style.set_property("background", "transparent").ok();
+            style
+                .set_property("left", &format!("{}px", f32::from(bounds.origin.x)))
+                .ok();
+            style
+                .set_property("top", &format!("{}px", f32::from(bounds.origin.y)))
+                .ok();
+            style
+                .set_property("width", &format!("{}px", f32::from(bounds.size.width)))
+                .ok();
+            style
+                .set_property("height", &format!("{}px", f32::from(bounds.size.height)))
+                .ok();
+        } else {
+            style
+                .set_property("width", "100%")
+                .map_err(|e| anyhow::anyhow!("Failed to set canvas width style: {e:?}"))?;
+            style
+                .set_property("height", "100%")
+                .map_err(|e| anyhow::anyhow!("Failed to set canvas height style: {e:?}"))?;
+        }
         style
             .set_property("display", "block")
             .map_err(|e| anyhow::anyhow!("Failed to set canvas display style: {e:?}"))?;
@@ -121,6 +154,9 @@ impl WebWindow {
             .map_err(|e| anyhow::anyhow!("Failed to create input element: {e:?}"))?
             .dyn_into()
             .map_err(|e| anyhow::anyhow!("Created element is not an input: {e:?}"))?;
+        input_element
+            .set_attribute("data-gpui-window-input", "")
+            .ok();
         let input_style = input_element.style();
         input_style.set_property("position", "fixed").ok();
         input_style.set_property("top", "0").ok();
@@ -139,7 +175,7 @@ impl WebWindow {
 
         let renderer_config = WgpuSurfaceConfig {
             size: device_size,
-            transparent: false,
+            transparent: is_child,
             preferred_present_mode: None,
         };
 
@@ -148,7 +184,11 @@ impl WebWindow {
         let display: Rc<dyn PlatformDisplay> = Rc::new(WebDisplay::new(browser_window.clone()));
 
         let initial_bounds = Bounds {
-            origin: Point::default(),
+            origin: if is_child {
+                params.bounds.origin
+            } else {
+                Point::default()
+            },
             size: Size::default(),
         };
 
@@ -184,6 +224,7 @@ impl WebWindow {
             is_composing: Cell::new(false),
             mql_handle: RefCell::new(None),
             pending_physical_size: Cell::new(None),
+            raf_id: Cell::new(None),
         });
 
         let raf_closure = inner.create_raf_closure();
@@ -202,6 +243,7 @@ impl WebWindow {
 
         Ok(Self {
             inner,
+            a11y: RefCell::new(None),
             display,
             handle,
             _raf_closure: raf_closure,
@@ -318,7 +360,8 @@ impl WebWindowInner {
 
             // Re-schedule for the next frame
             if let Some(ref func) = *raf_handle_inner.borrow() {
-                this.browser_window.request_animation_frame(func).ok();
+                this.raf_id
+                    .set(this.browser_window.request_animation_frame(func).ok());
             }
         });
 
@@ -330,9 +373,11 @@ impl WebWindowInner {
     }
 
     fn schedule_raf(&self, closure: &Closure<dyn FnMut()>) {
-        self.browser_window
-            .request_animation_frame(closure.as_ref().unchecked_ref())
-            .ok();
+        self.raf_id.set(
+            self.browser_window
+                .request_animation_frame(closure.as_ref().unchecked_ref())
+                .ok(),
+        );
     }
 
     fn observe_canvas(&self, observer: &web_sys::ResizeObserver) {
@@ -504,6 +549,32 @@ impl raw_window_handle::HasDisplayHandle for WebWindow {
     }
 }
 
+impl Drop for WebWindow {
+    /// A closed window leaves the page, and the keyboard goes back to the window under it.
+    fn drop(&mut self) {
+        // Everything that could still call one of this window's closures is stopped first: a
+        // closure invoked after its drop throws into the page.
+        if let Some(id) = self.inner.raf_id.take() {
+            self.inner.browser_window.cancel_animation_frame(id).ok();
+        }
+        if let Some(observer) = &self._resize_observer {
+            observer.disconnect();
+        }
+        self._event_listeners
+            .detach_from(&self.inner.browser_window);
+        self.inner.canvas.remove();
+        self.inner.input_element.remove();
+        if let Some(document) = self.inner.browser_window.document()
+            && let Ok(inputs) = document.query_selector_all("input[data-gpui-window-input]")
+            && inputs.length() > 0
+            && let Some(last) = inputs.get(inputs.length() - 1)
+            && let Ok(input) = last.dyn_into::<web_sys::HtmlElement>()
+        {
+            input.focus().ok();
+        }
+    }
+}
+
 impl PlatformWindow for WebWindow {
     fn bounds(&self) -> Bounds<Pixels> {
         self.inner.state.borrow().bounds
@@ -533,6 +604,17 @@ impl PlatformWindow for WebWindow {
 
     fn scale_factor(&self) -> f32 {
         self.inner.state.borrow().scale_factor
+    }
+
+    fn a11y_init(&self, callbacks: gpui::A11yCallbacks) {
+        *self.a11y.borrow_mut() = Some(crate::a11y::WebA11y::start(callbacks));
+    }
+
+    fn a11y_tree_update(&self, tree_update: accesskit::TreeUpdate) {
+        let dpr = f64::from(self.inner.state.borrow().scale_factor);
+        if let Some(a11y) = self.a11y.borrow().as_ref() {
+            a11y.borrow().tree_update(tree_update, dpr);
+        }
     }
 
     fn appearance(&self) -> WindowAppearance {

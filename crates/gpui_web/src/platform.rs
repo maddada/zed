@@ -105,6 +105,14 @@ impl WebPlatform {
     }
 }
 
+thread_local! {
+    static PASTED_CLIPBOARD: std::cell::RefCell<Option<ClipboardItem>> = const { std::cell::RefCell::new(None) };
+}
+
+pub(crate) fn set_pasted_clipboard(item: Option<ClipboardItem>) {
+    PASTED_CLIPBOARD.with(|slot| *slot.borrow_mut() = item);
+}
+
 impl Platform for WebPlatform {
     fn background_executor(&self) -> BackgroundExecutor {
         self.background_executor.clone()
@@ -340,8 +348,9 @@ impl Platform for WebPlatform {
         true
     }
 
+    /// Only ever holds something while a pasted image is being replayed to the app (events.rs); a page cannot read the system clipboard synchronously.
     fn read_from_clipboard(&self) -> Option<ClipboardItem> {
-        None
+        PASTED_CLIPBOARD.with(|slot| slot.borrow().clone())
     }
 
     fn write_to_clipboard(&self, item: ClipboardItem) {
