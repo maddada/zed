@@ -10,6 +10,7 @@ mod directx_renderer;
 mod dispatcher;
 mod display;
 mod events;
+mod file_dialog;
 mod keyboard;
 mod platform;
 mod system_settings;
