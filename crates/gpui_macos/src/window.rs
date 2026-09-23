@@ -12,9 +12,9 @@ use cocoa::{
         NSAppKitVersionNumber, NSAppKitVersionNumber12_0, NSApplication, NSBackingStoreBuffered,
         NSColor, NSEvent, NSEventModifierFlags, NSFilenamesPboardType, NSPasteboard,
         NSRequestUserAttentionType, NSScreen, NSView, NSViewHeightSizable, NSViewWidthSizable,
-        NSVisualEffectMaterial, NSVisualEffectState, NSVisualEffectView, NSWindow,
-        NSWindowCollectionBehavior, NSWindowOcclusionState, NSWindowOrderingMode,
-        NSWindowStyleMask, NSWindowTitleVisibility,
+        NSVisualEffectBlendingMode, NSVisualEffectMaterial, NSVisualEffectState,
+        NSVisualEffectView, NSWindow, NSWindowCollectionBehavior, NSWindowOcclusionState,
+        NSWindowOrderingMode, NSWindowStyleMask, NSWindowTitleVisibility,
     },
     base::{id, nil},
     foundation::{
@@ -494,6 +494,7 @@ struct MacWindowState {
     native_window: id,
     native_view: NonNull<Object>,
     blurred_view: Option<id>,
+    background_corner_radius: f64,
     background_appearance: WindowBackgroundAppearance,
     cursor_style: CursorStyle,
     cursor_visible: Arc<AtomicBool>,
@@ -889,6 +890,7 @@ impl MacWindow {
                 native_window,
                 native_view: NonNull::new_unchecked(native_view),
                 blurred_view: None,
+                background_corner_radius: 0.0,
                 background_appearance: WindowBackgroundAppearance::Opaque,
                 cursor_style: CursorStyle::Arrow,
                 cursor_visible,
@@ -1579,9 +1581,18 @@ impl PlatformWindow for MacWindow {
                         positioned: NSWindowOrderingMode::NSWindowBelow
                         relativeTo: nil
                     ];
+                    apply_background_corner_radius(blur_view, this.background_corner_radius);
                     this.blurred_view = Some(blur_view.autorelease());
                 }
             }
+        }
+    }
+
+    fn set_background_corner_radius(&self, radius: Pixels) {
+        let mut this = self.0.as_ref().lock();
+        this.background_corner_radius = f64::from(f32::from(radius));
+        if let Some(blur_view) = this.blurred_view {
+            unsafe { apply_background_corner_radius(blur_view, this.background_corner_radius) };
         }
     }
 
@@ -3097,8 +3108,11 @@ extern "C" fn blurred_view_init_with_frame(this: &Object, _: Sel, frame: NSRect)
     unsafe {
         let view = msg_send![super(this, class!(NSVisualEffectView)), initWithFrame: frame];
         // Use a colorless semantic material. The default value `AppearanceBased`, though not
-        // manually set, is deprecated.
-        NSVisualEffectView::setMaterial_(view, NSVisualEffectMaterial::Selection);
+        // manually set, is deprecated. `Selection` stopped producing a backdrop layer on
+        // macOS 26, which left blurred windows merely transparent; `UnderWindowBackground` is the
+        // material meant for the area behind a window's own content and still produces one.
+        NSVisualEffectView::setMaterial_(view, NSVisualEffectMaterial::UnderWindowBackground);
+        NSVisualEffectView::setBlendingMode_(view, NSVisualEffectBlendingMode::BehindWindow);
         NSVisualEffectView::setState_(view, NSVisualEffectState::Active);
         view
     }
@@ -3110,9 +3124,31 @@ extern "C" fn blurred_view_update_layer(this: &Object, _: Sel) {
         let layer: id = msg_send![this, layer];
         if !layer.is_null() {
             remove_layer_background(layer);
+            // Window snapshots (Mission Control, the app switcher's previews) drop backdrop
+            // layers, so with every background stripped the window would show there as nothing
+            // at all. The live blur covers this base everywhere else.
+            let black: id = msg_send![class!(NSColor), blackColor];
+            let black: id = msg_send![black, CGColor];
+            let _: () = msg_send![layer, setBackgroundColor: black];
         }
     }
 }
+
+unsafe fn apply_background_corner_radius(blur_view: id, radius: f64) {
+    unsafe {
+        let _: () = msg_send![blur_view, setWantsLayer: YES];
+        let layer: id = msg_send![blur_view, layer];
+        if layer.is_null() {
+            return;
+        }
+        let _: () = msg_send![layer, setCornerRadius: radius];
+        let _: () = msg_send![layer, setMasksToBounds: if radius > 0.0 { YES } else { NO }];
+    }
+}
+
+/// The material's own blur is tuned for thin sidebars. Under a tinted app surface a wider blur
+/// keeps desktop detail from reading through as noise.
+const BLURRED_VIEW_BLUR_RADIUS: f64 = 60.0;
 
 unsafe fn remove_layer_background(layer: id) {
     unsafe {
@@ -3127,6 +3163,21 @@ unsafe fn remove_layer_background(layer: id) {
 
         let filters: id = msg_send![layer, filters];
         if !filters.is_null() {
+            let blur_string: id = ns_string("Blur");
+            let count = NSArray::count(filters);
+            for i in 0..count {
+                let filter = filters.objectAtIndex(i);
+                let description: id = msg_send![filter, description];
+                let hit: BOOL = msg_send![description, containsString: blur_string];
+                if hit == YES {
+                    let radius: id =
+                        msg_send![class!(NSNumber), numberWithDouble: BLURRED_VIEW_BLUR_RADIUS];
+                    let _: () =
+                        msg_send![filter, setValue: radius forKey: ns_string("inputRadius")];
+                    let _: () = msg_send![layer, setFilters: filters];
+                    break;
+                }
+            }
             // Remove the increased saturation.
             // The effect of a `CAFilter` or `CIFilter` is determined by its name, and the
             // `description` reflects its name and some parameters. Currently `NSVisualEffectView`
