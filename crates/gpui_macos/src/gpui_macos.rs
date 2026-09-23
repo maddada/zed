@@ -28,6 +28,8 @@ mod text_system;
 mod platform;
 mod window;
 mod window_appearance;
+mod window_wallpaper;
+mod window_wallpaper_system;
 
 use cocoa::{
     base::{id, nil},

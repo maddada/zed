@@ -745,6 +745,21 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn set_background_appearance(&self, background_appearance: WindowBackgroundAppearance);
     /// Rounds the blurred background's corners, for windows whose content is a rounded card.
     fn set_background_corner_radius(&self, _radius: Pixels) {}
+    /// Limits a blurred background to these rounded rectangles, in window coordinates, for a
+    /// window whose content is several separate cards; an empty list blurs the whole window.
+    fn set_background_blur_region(&self, _region: Vec<(Bounds<Pixels>, Pixels)>) {}
+    /// Makes a blurred background show the blurred desktop picture instead of blurring every window
+    /// behind this one.
+    fn set_background_wallpaper(&self, _wallpaper: bool) {}
+    /// The picture a wallpaper background shows instead of the desktop picture; `None` goes back to
+    /// the desktop picture.
+    fn set_background_wallpaper_image(&self, _image: Option<std::path::PathBuf>) {}
+    /// Whether a wallpaper background's picture stays still against the screen while the window
+    /// moves (`true`), or is attached to the window and covers it (`false`, the default).
+    fn set_background_wallpaper_follows_screen(&self, _follows_screen: bool) {}
+    /// For a picture attached to the window: the rectangle, in window coordinates, the picture
+    /// covers instead of the window itself; `None` covers the window.
+    fn set_background_wallpaper_cover(&self, _cover: Option<Bounds<Pixels>>) {}
     fn minimize(&self);
     fn zoom(&self);
     fn toggle_fullscreen(&self);

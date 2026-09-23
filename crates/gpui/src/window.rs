@@ -2469,6 +2469,40 @@ impl Window {
         self.platform_window.set_background_corner_radius(radius);
     }
 
+    /// Limits a blurred window background to these rounded rectangles, in window coordinates, so a
+    /// window holding several separate cards blurs only behind them. An empty list blurs the whole
+    /// window again.
+    pub fn set_background_blur_region(&self, region: Vec<(Bounds<Pixels>, Pixels)>) {
+        self.platform_window.set_background_blur_region(region);
+    }
+
+    /// Makes a blurred window background show the blurred desktop picture rather than every window
+    /// behind this one. Platforms that cannot read the desktop picture keep the live blur.
+    pub fn set_background_wallpaper(&self, wallpaper: bool) {
+        self.platform_window.set_background_wallpaper(wallpaper);
+    }
+
+    /// Makes a wallpaper background show this picture, blurred, instead of the desktop picture. A
+    /// picture that cannot be read leaves the live blur.
+    pub fn set_background_wallpaper_image(&self, image: Option<std::path::PathBuf>) {
+        self.platform_window.set_background_wallpaper_image(image);
+    }
+
+    /// Whether a wallpaper background's picture stays still against the screen while the window
+    /// moves, or (the default) is attached to the window and covers it, which needs no update
+    /// while the window is dragged.
+    pub fn set_background_wallpaper_follows_screen(&self, follows_screen: bool) {
+        self.platform_window
+            .set_background_wallpaper_follows_screen(follows_screen);
+    }
+
+    /// Makes a picture attached to the window cover this rectangle, in window coordinates, instead
+    /// of the window itself, so a window laid over part of another shows the same part of the same
+    /// picture. `None` covers the window.
+    pub fn set_background_wallpaper_cover(&self, cover: Option<Bounds<Pixels>>) {
+        self.platform_window.set_background_wallpaper_cover(cover);
+    }
+
     /// Mark the window as dirty at the platform level.
     pub fn set_window_edited(&mut self, edited: bool) {
         self.platform_window.set_edited(edited);
