@@ -720,6 +720,10 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn window_bounds(&self) -> WindowBounds;
     fn content_size(&self) -> Size<Pixels>;
     fn resize(&mut self, size: Size<Pixels>);
+    #[cfg(target_os = "linux")]
+    fn set_x11_frame_in_parent(&mut self, _frame: Bounds<Pixels>) -> bool {
+        false
+    }
     fn scale_factor(&self) -> f32;
     fn appearance(&self) -> WindowAppearance;
     fn display(&self) -> Option<Rc<dyn PlatformDisplay>>;
@@ -1704,6 +1708,11 @@ pub struct WindowOptions {
     /// The kind of window to create
     pub kind: WindowKind,
 
+    /// Explicit owner for an X11 transient window, resolved before the window is mapped.
+    /// Other Linux backends ignore this option. None preserves focus-derived ownership.
+    #[cfg(target_os = "linux")]
+    pub x11_parent: Option<AnyWindowHandle>,
+
     /// Whether the window can be moved by the user. When `false`, the user cannot drag
     /// the window (on macOS this sets `NSWindow.isMovable`, which also disables the
     /// Window-menu tiling items); programmatic moves are still allowed.
@@ -1772,6 +1781,11 @@ pub struct WindowParams {
     /// The kind of window to create
     #[cfg_attr(any(target_os = "linux", target_os = "freebsd"), allow(dead_code))]
     pub kind: WindowKind,
+
+    /// Explicit owner for an X11 transient window, resolved before the window is mapped.
+    /// Other Linux backends ignore this option. None preserves focus-derived ownership.
+    #[cfg(target_os = "linux")]
+    pub x11_parent: Option<AnyWindowHandle>,
 
     /// Whether the window should be movable by the user
     #[cfg_attr(any(target_os = "linux", target_os = "freebsd"), allow(dead_code))]
@@ -1869,6 +1883,8 @@ impl Default for WindowOptions {
             focus: true,
             show: true,
             kind: WindowKind::Normal,
+            #[cfg(target_os = "linux")]
+            x11_parent: None,
             is_movable: true,
             app_owns_titlebar_drag: false,
             is_resizable: true,

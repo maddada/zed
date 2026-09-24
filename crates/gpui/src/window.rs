@@ -1295,6 +1295,8 @@ impl Window {
             focus,
             show,
             kind,
+            #[cfg(target_os = "linux")]
+            x11_parent,
             is_movable,
             app_owns_titlebar_drag,
             is_resizable,
@@ -1324,6 +1326,8 @@ impl Window {
                 bounds: window_bounds.get_bounds(),
                 titlebar,
                 kind,
+                #[cfg(target_os = "linux")]
+                x11_parent,
                 is_movable,
                 app_owns_titlebar_drag,
                 is_resizable,
@@ -2350,6 +2354,13 @@ impl Window {
     /// Set the content size of the window.
     pub fn resize(&mut self, size: Size<Pixels>) {
         self.platform_window.resize(size);
+    }
+
+    /// Set an X11 child window frame in its explicit owner's content coordinates.
+    /// Returns false when this is not an X11 window with a live explicit owner.
+    #[cfg(target_os = "linux")]
+    pub fn set_x11_frame_in_parent(&mut self, frame: Bounds<Pixels>) -> bool {
+        self.platform_window.set_x11_frame_in_parent(frame)
     }
 
     /// Returns whether or not the window is currently fullscreen
