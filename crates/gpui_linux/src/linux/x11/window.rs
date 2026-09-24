@@ -259,6 +259,11 @@ pub struct X11WindowState {
     pub destroyed: bool,
     pub(crate) keyboard_focus_window: xproto::Window,
     parent: Option<X11WindowStatePtr>,
+    #[cfg(target_os = "linux")]
+    explicit_owner: Option<X11WindowStatePtr>,
+    fixed_size: bool,
+    #[cfg(target_os = "linux")]
+    owned_children: FxHashSet<xproto::Window>,
     children: FxHashSet<xproto::Window>,
     client: X11ClientStatePtr,
     executor: ForegroundExecutor,
@@ -640,6 +645,8 @@ impl X11WindowState {
                 }
             }
 
+            #[cfg(target_os = "linux")]
+            let explicit_owner = params.x11_parent.and(parent_window.clone());
             let parent = if params.kind == WindowKind::Dialog
                 && let Some(parent) = parent_window
             {
@@ -785,6 +792,14 @@ impl X11WindowState {
                     Some((f32::from(size.width) as i32, f32::from(size.height) as i32));
             }
             size_hints.max_size = Some((max_texture_size as i32, max_texture_size as i32));
+            // CDXC:PlatformSupport 2026-09-24 WHY:
+            // A fixed-size Linux window needs equal physical-pixel size hints. Programmatic fit-height resizes update both limits, so dialogs are not trapped at their first-frame estimate.
+            let fixed_size = cfg!(target_os = "linux") && !params.is_resizable;
+            if fixed_size {
+                let dimensions = (bounds.size.width.0, bounds.size.height.0);
+                size_hints.min_size = Some(dimensions);
+                size_hints.max_size = Some(dimensions);
+            }
             check_reply(
                 || {
                     format!(
@@ -821,6 +836,11 @@ impl X11WindowState {
             let display = Rc::new(X11Display::new(xcb, scale_factor, x_screen_index)?);
 
             Ok(Self {
+                #[cfg(target_os = "linux")]
+                explicit_owner,
+                fixed_size,
+                #[cfg(target_os = "linux")]
+                owned_children: FxHashSet::default(),
                 parent,
                 keyboard_focus_window,
                 children: FxHashSet::default(),
@@ -880,6 +900,15 @@ impl Drop for X11Window {
 
         if let Some(parent) = state.parent.as_ref() {
             parent.state.borrow_mut().children.remove(&self.0.x_window);
+        }
+
+        #[cfg(target_os = "linux")]
+        if let Some(owner) = state.explicit_owner.as_ref() {
+            owner
+                .state
+                .borrow_mut()
+                .owned_children
+                .remove(&self.0.x_window);
         }
 
         state.renderer.destroy();
@@ -964,6 +993,10 @@ impl X11Window {
 
         let state = ptr.state.borrow_mut();
         ptr.set_wm_properties(state)?;
+        #[cfg(target_os = "linux")]
+        if let Some(owner) = ptr.state.borrow().explicit_owner.as_ref() {
+            owner.state.borrow_mut().owned_children.insert(x_window);
+        }
 
         Ok(Self(ptr))
     }
@@ -1160,6 +1193,11 @@ impl X11WindowStatePtr {
         let client = state.client.clone();
         #[allow(clippy::mutable_key_type)]
         let children = state.children.clone();
+        #[cfg(target_os = "linux")]
+        let children = children
+            .union(&state.owned_children)
+            .copied()
+            .collect::<Vec<_>>();
         drop(state);
 
         if let Some(client) = client.get_client() {
@@ -1420,6 +1458,21 @@ impl PlatformWindow for X11Window {
         let size = size.to_device_pixels(state.scale_factor);
         let width = size.width.0 as u32;
         let height = size.height.0 as u32;
+        if state.fixed_size {
+            let mut hints = WmSizeHints::new();
+            let dimensions = (width as i32, height as i32);
+            hints.min_size = Some(dimensions);
+            hints.max_size = Some(dimensions);
+            if check_reply(
+                || "X11 fixed-size window hints update failed",
+                hints.set_normal_hints(&*self.0.xcb, self.0.x_window),
+            )
+            .log_err()
+            .is_none()
+            {
+                return;
+            }
+        }
 
         check_reply(
             || {
@@ -1437,6 +1490,40 @@ impl PlatformWindow for X11Window {
         )
         .log_err();
         xcb_flush(&self.0.xcb);
+    }
+
+    #[cfg(target_os = "linux")]
+    fn set_x11_frame_in_parent(&mut self, frame: Bounds<Pixels>) -> bool {
+        let bounds = {
+            let state = self.0.state.borrow();
+            let Some(owner) = state.explicit_owner.as_ref() else {
+                return false;
+            };
+            let owner = owner.state.borrow();
+            if owner.destroyed {
+                return false;
+            }
+            Bounds::new(owner.bounds.origin + frame.origin, frame.size)
+        };
+        if self.bounds() == bounds {
+            return true;
+        }
+        self.resize(bounds.size);
+        let scale = self.0.state.borrow().scale_factor;
+        let origin = bounds.to_device_pixels(scale).origin;
+        let moved = check_reply(
+            || "X11 transient window placement failed",
+            self.0.xcb.configure_window(
+                self.0.x_window,
+                &xproto::ConfigureWindowAux::new()
+                    .x(origin.x.0)
+                    .y(origin.y.0),
+            ),
+        )
+        .log_err()
+        .is_some();
+        xcb_flush(&self.0.xcb);
+        moved
     }
 
     fn scale_factor(&self) -> f32 {
