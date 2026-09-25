@@ -764,6 +764,10 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     /// For a picture attached to the window: the rectangle, in window coordinates, the picture
     /// covers instead of the window itself; `None` covers the window.
     fn set_background_wallpaper_cover(&self, _cover: Option<Bounds<Pixels>>) {}
+    /// A looping, muted video a wallpaper background plays, blurred, in place of its picture;
+    /// `None` goes back to the picture. `only_on_power` pauses it while the computer runs on
+    /// battery.
+    fn set_background_video(&self, _video: Option<std::path::PathBuf>, _only_on_power: bool) {}
     fn minimize(&self);
     fn zoom(&self);
     fn toggle_fullscreen(&self);
