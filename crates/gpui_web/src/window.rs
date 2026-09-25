@@ -183,13 +183,21 @@ impl WebWindow {
 
         let display: Rc<dyn PlatformDisplay> = Rc::new(WebDisplay::new(browser_window.clone()));
 
+        // An overlay window already has its CSS size, so its first frame lays out at that size.
+        // Starting it at zero (the resize observer reports the size only after the first frame)
+        // made a dialog that fits its window to its content measure itself at zero width and
+        // resize the window to that.
         let initial_bounds = Bounds {
             origin: if is_child {
                 params.bounds.origin
             } else {
                 Point::default()
             },
-            size: Size::default(),
+            size: if is_child {
+                params.bounds.size
+            } else {
+                Size::default()
+            },
         };
 
         let mutable_state = WebWindowMutableState {
