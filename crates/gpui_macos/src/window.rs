@@ -237,6 +237,10 @@ unsafe fn build_classes() {
                 set_content_size_held as extern "C" fn(&Object, Sel, BOOL),
             );
             decl.add_method(
+                sel!(ghostexSetContentSizeHeldFromLeft:),
+                set_content_size_held_from_left as extern "C" fn(&Object, Sel, BOOL),
+            );
+            decl.add_method(
                 sel!(displayLayer:),
                 display_layer as extern "C" fn(&Object, Sel, id),
             );
@@ -536,6 +540,9 @@ struct MacWindowState {
     /// view's right edge, so a window that grows or shrinks from its left edge slides its content
     /// instead of re-rendering it at every intermediate width.
     held_content_size: Option<Size<Pixels>>,
+    /// The held content is pinned to the view's left edge instead (`ghostexSetContentSizeHeldFromLeft:`),
+    /// for a window that grows or shrinks from its right edge.
+    held_content_pinned_left: bool,
     /// Rounded rectangles the blurred background is limited to; empty blurs the whole window.
     background_blur_region: Vec<(NSRect, f64)>,
     background_appearance: WindowBackgroundAppearance,
@@ -947,6 +954,7 @@ impl MacWindow {
                 video_view: None,
                 background_corner_radius: 0.0,
                 held_content_size: None,
+                held_content_pinned_left: false,
                 background_blur_region: Vec::new(),
                 background_appearance: WindowBackgroundAppearance::Opaque,
                 cursor_style: CursorStyle::Arrow,
@@ -2461,7 +2469,10 @@ extern "C" fn handle_view_event(this: &Object, _: Sel, native_event: id) {
     if let Some(mut event) = event {
         // While the content size is held the content is drawn pinned to the view's right edge, so
         // a pointer position in the narrower view maps that far to the right in GPUI's layout.
-        if let Some(held) = lock.held_content_size {
+        if let Some(held) = lock
+            .held_content_size
+            .filter(|_| !lock.held_content_pinned_left)
+        {
             let live_width = unsafe { NSView::frame(lock.native_window.contentView()) }
                 .size
                 .width;
@@ -3044,6 +3055,16 @@ extern "C" fn set_frame_size(this: &Object, _: Sel, size: NSSize) {
 /// Holds (or releases) the size GPUI lays out at while the embedder animates the window's frame.
 /// Releasing it catches GPUI up with whatever size the view ended at.
 extern "C" fn set_content_size_held(this: &Object, _: Sel, held: BOOL) {
+    hold_content_size(this, held, false);
+}
+
+/// `ghostexSetContentSizeHeld:` for a window that slides in from the right: the held content is
+/// pinned to the view's left edge, which also leaves pointer positions as they are.
+extern "C" fn set_content_size_held_from_left(this: &Object, _: Sel, held: BOOL) {
+    hold_content_size(this, held, true);
+}
+
+fn hold_content_size(this: &Object, held: BOOL, pinned_left: bool) {
     let window_state = unsafe { get_window_state(this) };
     let mut lock = window_state.as_ref().lock();
     let layer = lock.renderer.layer_ptr() as id;
@@ -3052,12 +3073,15 @@ extern "C" fn set_content_size_held(this: &Object, _: Sel, held: BOOL) {
             let NSSize { width, height, .. } =
                 unsafe { NSView::frame(lock.native_window.contentView()) }.size;
             lock.held_content_size = Some(size(px(width as f32), px(height as f32)));
+            lock.held_content_pinned_left = pinned_left;
+            let gravity = if pinned_left { "left" } else { "right" };
             unsafe {
-                let _: () = msg_send![layer, setContentsGravity: ns_string("right")];
+                let _: () = msg_send![layer, setContentsGravity: ns_string(gravity)];
             }
         }
         return;
     }
+    lock.held_content_pinned_left = false;
     let Some(held) = lock.held_content_size.take() else {
         return;
     };
