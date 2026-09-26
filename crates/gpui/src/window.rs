@@ -2959,6 +2959,14 @@ impl Window {
         self.platform_window.set_background_corner_radius(radius);
     }
 
+    /// Ghostex: tunes a blurred window background for a small floating surface such as a menu or
+    /// tooltip: how wide the blur is, and whether the backdrop keeps its colour saturation, so the
+    /// colours behind the surface show through instead of washing out to grey.
+    pub fn set_background_blur_style(&self, radius: Pixels, keep_saturation: bool) {
+        self.platform_window
+            .set_background_blur_style(radius, keep_saturation);
+    }
+
     /// Limits a blurred window background to these rounded rectangles, in window coordinates, so a
     /// window holding several separate cards blurs only behind them. An empty list blurs the whole
     /// window again.

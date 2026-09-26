@@ -299,6 +299,8 @@ unsafe fn build_classes() {
         BLURRED_VIEW_CLASS = {
             let mut decl = ClassDecl::new("BlurredView", class!(NSVisualEffectView)).unwrap();
             decl.add_ivar::<id>(BLURRED_VIEW_REGION_MASK_IVAR);
+            decl.add_ivar::<f64>(BLURRED_VIEW_RADIUS_IVAR);
+            decl.add_ivar::<BOOL>(BLURRED_VIEW_KEEP_SATURATION_IVAR);
             decl.add_method(
                 sel!(initWithFrame:),
                 blurred_view_init_with_frame as extern "C" fn(&Object, Sel, NSRect) -> id,
@@ -667,6 +669,9 @@ struct MacWindowState {
     native_view: NonNull<Object>,
     blurred_view: Option<id>,
     background_corner_radius: f64,
+    /// The blur radius (0 = `BLURRED_VIEW_BLUR_RADIUS`) and whether the backdrop keeps its
+    /// saturation (`set_background_blur_style`).
+    background_blur_style: (f64, bool),
     /// Rounded rectangles the blurred background is limited to; empty blurs the whole window.
     background_blur_region: Vec<(NSRect, f64)>,
     background_appearance: WindowBackgroundAppearance,
@@ -1103,6 +1108,7 @@ impl MacWindow {
                 native_view: NonNull::new_unchecked(native_view),
                 blurred_view: None,
                 background_corner_radius: 0.0,
+                background_blur_style: (0.0, false),
                 background_blur_region: Vec::new(),
                 background_appearance: WindowBackgroundAppearance::Opaque,
                 cursor_style: CursorStyle::Arrow,
@@ -1901,8 +1907,17 @@ impl PlatformWindow for MacWindow {
                 ];
                 apply_background_corner_radius(blur_view, this.background_corner_radius);
                 apply_background_blur_region(blur_view, &this.background_blur_region);
+                apply_background_blur_style(blur_view, this.background_blur_style);
                 this.blurred_view = Some(blur_view.autorelease());
             }
+        }
+    }
+
+    fn set_background_blur_style(&self, radius: Pixels, keep_saturation: bool) {
+        let mut this = self.0.as_ref().lock();
+        this.background_blur_style = (f64::from(f32::from(radius)), keep_saturation);
+        if let Some(blur_view) = this.blurred_view {
+            unsafe { apply_background_blur_style(blur_view, this.background_blur_style) };
         }
     }
 
@@ -3843,7 +3858,17 @@ extern "C" fn blurred_view_update_layer(this: &Object, _: Sel) {
         let _: () = msg_send![super(this, class!(NSVisualEffectView)), updateLayer];
         let layer: id = msg_send![this, layer];
         if !layer.is_null() {
-            remove_layer_background(layer);
+            let radius: f64 = *this.get_ivar(BLURRED_VIEW_RADIUS_IVAR);
+            let keep_saturation: BOOL = *this.get_ivar(BLURRED_VIEW_KEEP_SATURATION_IVAR);
+            remove_layer_background(
+                layer,
+                if radius > 0.0 {
+                    radius
+                } else {
+                    BLURRED_VIEW_BLUR_RADIUS
+                },
+                keep_saturation == YES,
+            );
             // Window snapshots (Mission Control, the app switcher's previews) drop backdrop
             // layers, so with every background stripped the window would show there as nothing
             // at all. The live blur covers this base everywhere else.
@@ -3876,6 +3901,26 @@ unsafe fn apply_background_corner_radius(blur_view: id, radius: f64) {
 
 /// Holds the `CAShapeLayer` that masks a `BlurredView` to its blur region, or nil.
 const BLURRED_VIEW_REGION_MASK_IVAR: &str = "ghostexRegionMask";
+
+/// A `BlurredView`'s own blur radius (0 = `BLURRED_VIEW_BLUR_RADIUS`).
+const BLURRED_VIEW_RADIUS_IVAR: &str = "ghostexBlurRadius";
+
+/// Whether a `BlurredView` keeps the material's saturation filter.
+const BLURRED_VIEW_KEEP_SATURATION_IVAR: &str = "ghostexKeepSaturation";
+
+/// Stores the blur style on the view and has AppKit rebuild its layer, which applies it
+/// (`blurred_view_update_layer`).
+unsafe fn apply_background_blur_style(blur_view: id, (radius, keep_saturation): (f64, bool)) {
+    unsafe {
+        let object = &mut *(blur_view as *mut Object);
+        object.set_ivar::<f64>(BLURRED_VIEW_RADIUS_IVAR, radius);
+        object.set_ivar::<BOOL>(
+            BLURRED_VIEW_KEEP_SATURATION_IVAR,
+            if keep_saturation { YES } else { NO },
+        );
+        let _: () = msg_send![blur_view, setNeedsDisplay: YES];
+    }
+}
 
 /// Masks the blurred view to rounded rectangles given in the window's top-left coordinates, so a
 /// window holding several separate cards blurs only behind the cards and not the gaps between
@@ -3949,7 +3994,11 @@ unsafe extern "C" {
     fn CGPathRelease(path: *mut c_void);
 }
 
-unsafe fn remove_layer_background(layer: id) {
+/// The material's own blur is tuned for thin sidebars. Under a tinted app surface a wider blur
+/// keeps desktop detail from reading through as noise.
+const BLURRED_VIEW_BLUR_RADIUS: f64 = 60.0;
+
+unsafe fn remove_layer_background(layer: id, blur_radius: f64, keep_saturation: bool) {
     unsafe {
         let _: () = msg_send![layer, setBackgroundColor:nil];
 
@@ -3962,6 +4011,20 @@ unsafe fn remove_layer_background(layer: id) {
 
         let filters: id = msg_send![layer, filters];
         if !filters.is_null() {
+            let blur_string: id = ns_string("Blur");
+            let count = NSArray::count(filters);
+            for i in 0..count {
+                let filter = filters.objectAtIndex(i);
+                let description: id = msg_send![filter, description];
+                let hit: BOOL = msg_send![description, containsString: blur_string];
+                if hit == YES {
+                    let radius: id = msg_send![class!(NSNumber), numberWithDouble: blur_radius];
+                    let _: () =
+                        msg_send![filter, setValue: radius forKey: ns_string("inputRadius")];
+                    let _: () = msg_send![layer, setFilters: filters];
+                    break;
+                }
+            }
             // Remove the increased saturation.
             // The effect of a `CAFilter` or `CIFilter` is determined by its name, and the
             // `description` reflects its name and some parameters. Currently `NSVisualEffectView`
@@ -3972,7 +4035,7 @@ unsafe fn remove_layer_background(layer: id) {
             for i in 0..count {
                 let description: id = msg_send![filters.objectAtIndex(i), description];
                 let hit: BOOL = msg_send![description, containsString: test_string];
-                if hit == NO {
+                if hit == NO || keep_saturation {
                     continue;
                 }
 
@@ -3994,7 +4057,7 @@ unsafe fn remove_layer_background(layer: id) {
             let count = NSArray::count(sublayers);
             for i in 0..count {
                 let sublayer = sublayers.objectAtIndex(i);
-                remove_layer_background(sublayer);
+                remove_layer_background(sublayer, blur_radius, keep_saturation);
             }
         }
     }
