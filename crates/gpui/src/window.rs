@@ -2974,6 +2974,51 @@ impl Window {
         self.platform_window.set_background_blur_region(region);
     }
 
+    /// Makes a blurred window background show the blurred desktop picture rather than every window
+    /// behind this one. Platforms that cannot read the desktop picture keep the live blur.
+    pub fn set_background_wallpaper(&self, wallpaper: bool) {
+        self.platform_window.set_background_wallpaper(wallpaper);
+    }
+
+    /// Makes a wallpaper background show this picture, blurred, instead of the desktop picture. A
+    /// picture that cannot be read leaves the live blur.
+    pub fn set_background_wallpaper_image(&self, image: Option<std::path::PathBuf>) {
+        self.platform_window.set_background_wallpaper_image(image);
+    }
+
+    /// Whether a wallpaper background's picture stays still against the screen while the window
+    /// moves, or (the default) is attached to the window and covers it, which needs no update
+    /// while the window is dragged.
+    pub fn set_background_wallpaper_follows_screen(&self, follows_screen: bool) {
+        self.platform_window
+            .set_background_wallpaper_follows_screen(follows_screen);
+    }
+
+    /// Makes a picture attached to the window cover this rectangle, in window coordinates, instead
+    /// of the window itself, so a window laid over part of another shows the same part of the same
+    /// picture. `None` covers the window.
+    pub fn set_background_wallpaper_cover(&self, cover: Option<Bounds<Pixels>>) {
+        self.platform_window.set_background_wallpaper_cover(cover);
+    }
+
+    /// Makes a wallpaper background play this video, muted, looping and blurred, placed like its
+    /// picture. It pauses whenever nobody can see it (the app in the background, the window
+    /// hidden, the screen asleep), in Low Power Mode, under Reduce Motion (which shows its first
+    /// frame), and on battery when `only_on_power` is set. A video that cannot be read leaves the
+    /// live blur; `None` goes back to the picture.
+    pub fn set_background_video(&self, video: Option<std::path::PathBuf>, only_on_power: bool) {
+        self.platform_window
+            .set_background_video(video, only_on_power);
+    }
+
+    /// Ghostex: makes a wallpaper background draw an animated live style instead of its picture or
+    /// video. It stops moving under the same conditions as the video (nobody can see it, Low Power
+    /// Mode, battery when `only_on_power` is set) and shows a still frame under Reduce Motion. A
+    /// style the platform does not draw leaves the live blur; `None` goes back to the picture.
+    pub fn set_background_live(&self, live: Option<crate::LiveBackground>) {
+        self.platform_window.set_background_live(live);
+    }
+
     /// Ghostex: marks this window as a frosted surface. Its blurred background is then limited to
     /// the regions its elements report each frame through [`Window::report_frosted_region`].
     pub fn set_frosted_surface(&mut self, frosted: bool) {

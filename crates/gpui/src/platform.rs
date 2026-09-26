@@ -947,6 +947,25 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     /// Limits a blurred background to these rounded rectangles, in window coordinates, for a
     /// window whose content is several separate cards; an empty list blurs the whole window.
     fn set_background_blur_region(&self, _region: Vec<(Bounds<Pixels>, Pixels)>) {}
+    /// Makes a blurred background show the blurred desktop picture instead of blurring every window
+    /// behind this one.
+    fn set_background_wallpaper(&self, _wallpaper: bool) {}
+    /// The picture a wallpaper background shows instead of the desktop picture; `None` goes back to
+    /// the desktop picture.
+    fn set_background_wallpaper_image(&self, _image: Option<std::path::PathBuf>) {}
+    /// Whether a wallpaper background's picture stays still against the screen while the window
+    /// moves (`true`), or is attached to the window and covers it (`false`, the default).
+    fn set_background_wallpaper_follows_screen(&self, _follows_screen: bool) {}
+    /// For a picture attached to the window: the rectangle, in window coordinates, the picture
+    /// covers instead of the window itself; `None` covers the window.
+    fn set_background_wallpaper_cover(&self, _cover: Option<Bounds<Pixels>>) {}
+    /// A looping, muted video a wallpaper background plays, blurred, in place of its picture;
+    /// `None` goes back to the picture. `only_on_power` pauses it while the computer runs on
+    /// battery.
+    fn set_background_video(&self, _video: Option<std::path::PathBuf>, _only_on_power: bool) {}
+    /// An animated backdrop a wallpaper background draws in place of its picture or video; `None`
+    /// goes back to them.
+    fn set_background_live(&self, _live: Option<LiveBackground>) {}
     fn minimize(&self);
     fn zoom(&self);
     fn toggle_fullscreen(&self);
@@ -2471,6 +2490,22 @@ pub enum WindowAppearance {
     ///
     /// On macOS, this corresponds to the `NSAppearanceNameVibrantDark` appearance.
     VibrantDark,
+}
+
+/// Ghostex: an animated backdrop the platform draws behind a wallpaper background in place of a
+/// picture or video: one of the platform's live styles, painted in the given colours.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LiveBackground {
+    /// The style's id; a style the platform does not draw leaves the live blur.
+    pub style: SharedString,
+    /// The colours it paints with, from the deepest to the brightest, as sRGB components in 0-1.
+    pub colors: [[f32; 3]; 3],
+    /// How fast it moves; 1 is the style's own pace.
+    pub speed: f32,
+    /// How bright it is drawn, 0-1: lower dims it toward its deepest colour.
+    pub brightness: f32,
+    /// Stop moving while the computer runs on battery.
+    pub only_on_power: bool,
 }
 
 /// The appearance of the background of the window itself, when there is
