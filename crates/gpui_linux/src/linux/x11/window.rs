@@ -59,6 +59,7 @@ x11rb::atom_manager! {
         WM_DELETE_WINDOW,
         WM_CHANGE_STATE,
         WM_TRANSIENT_FOR,
+        _GPUI_KEYBOARD_FOCUS_WINDOW,
         _NET_WM_PID,
         _NET_WM_NAME,
         _NET_WM_ICON,
@@ -258,6 +259,10 @@ pub struct Callbacks {
 
 pub struct X11WindowState {
     pub destroyed: bool,
+    pub(crate) keyboard_focus_window: xproto::Window,
+    /// `activate` asked the WM for focus while the window did not have it; the keyboard-focus child
+    /// takes focus when the WM grants it.
+    activation_focus_pending: bool,
     parent: Option<X11WindowStatePtr>,
     children: FxHashSet<xproto::Window>,
     client: X11ClientStatePtr,
@@ -555,6 +560,45 @@ impl X11WindowState {
 
         // Collect errors during setup, so that window can be destroyed on failure.
         let setup_result = maybe!({
+            // CDXC:FocusRouting 2026-09-18 WHY:
+            // Focusing the toplevel lets X11 send keys to embedded Chromium under the pointer; a leaf focus window prevents that redirection.
+            // GPUI must select and dispatch keys on the leaf itself because keyboard events do not propagate above the X focus window.
+            // SEE-ALSO: client.rs maps this child to its owning window; Ghostex's apps/desktop/src/cef/linux_x11.rs reads the property for native handoffs.
+            let keyboard_focus_window = xcb.generate_id()?;
+            check_reply(
+                || "X11 keyboard-focus window creation failed.",
+                xcb.create_window(
+                    0,
+                    keyboard_focus_window,
+                    x_window,
+                    -1,
+                    -1,
+                    1,
+                    1,
+                    0,
+                    xproto::WindowClass::INPUT_ONLY,
+                    x11rb::COPY_FROM_PARENT,
+                    &xproto::CreateWindowAux::new().event_mask(
+                        xproto::EventMask::KEY_PRESS
+                            | xproto::EventMask::KEY_RELEASE
+                            | xproto::EventMask::FOCUS_CHANGE,
+                    ),
+                ),
+            )?;
+            check_reply(
+                || "X11 keyboard-focus window mapping failed.",
+                xcb.map_window(keyboard_focus_window),
+            )?;
+            check_reply(
+                || "X11 keyboard-focus window property failed.",
+                xcb.change_property32(
+                    xproto::PropMode::REPLACE,
+                    x_window,
+                    atoms._GPUI_KEYBOARD_FOCUS_WINDOW,
+                    xproto::AtomEnum::WINDOW,
+                    &[keyboard_focus_window],
+                ),
+            )?;
             let pid = std::process::id();
             check_reply(
                 || "X11 ChangeProperty for _NET_WM_PID failed.",
@@ -819,6 +863,8 @@ impl X11WindowState {
 
             Ok(Self {
                 parent,
+                keyboard_focus_window,
+                activation_focus_pending: false,
                 children: FxHashSet::default(),
                 client,
                 executor,
@@ -1049,6 +1095,31 @@ impl X11Window {
 }
 
 impl X11WindowStatePtr {
+    /// Moves X focus from the toplevel to its keyboard-focus child when the WM grants focus that
+    /// `activate` asked for. Only focus arriving from outside the window (`Ancestor`, `Nonlinear`)
+    /// counts: focus coming back from an inferior is an embedded client's own handoff, and focus
+    /// already on an inferior needs no move.
+    pub(crate) fn focus_keyboard_window_after_activation(&self, detail: xproto::NotifyDetail) {
+        let keyboard_focus_window = {
+            let mut state = self.state.borrow_mut();
+            if !std::mem::take(&mut state.activation_focus_pending) {
+                return;
+            }
+            state.keyboard_focus_window
+        };
+        if detail != xproto::NotifyDetail::ANCESTOR && detail != xproto::NotifyDetail::NONLINEAR {
+            return;
+        }
+        self.xcb
+            .set_input_focus(
+                xproto::InputFocus::POINTER_ROOT,
+                keyboard_focus_window,
+                xproto::Time::CURRENT_TIME,
+            )
+            .log_err();
+        xcb_flush(&self.xcb);
+    }
+
     pub fn should_close(&self) -> bool {
         let mut cb = self.callbacks.borrow_mut();
         if let Some(mut should_close) = cb.should_close.take() {
@@ -1543,6 +1614,24 @@ impl PlatformWindow for X11Window {
                 message,
             )
             .log_err();
+        // CDXC:FocusRouting 2026-09-26 WHY:
+        // Activation is the WM's to grant (`_NET_ACTIVE_WINDOW` above; upstream stopped forcing SetInputFocus on the toplevel so the WM's focus policy holds). GPUI still has to put the keyboard on its leaf child once it has focus, or keys go to embedded Chromium under the pointer. A window that already holds focus moves it to the leaf now; otherwise the leaf takes it when the WM's FocusIn arrives (`focus_keyboard_window_after_activation`).
+        let (active, keyboard_focus_window) = {
+            let state = self.0.state.borrow();
+            (state.active, state.keyboard_focus_window)
+        };
+        if active {
+            self.0
+                .xcb
+                .set_input_focus(
+                    xproto::InputFocus::POINTER_ROOT,
+                    keyboard_focus_window,
+                    xproto::Time::CURRENT_TIME,
+                )
+                .log_err();
+        } else {
+            self.0.state.borrow_mut().activation_focus_pending = true;
+        }
         xcb_flush(&self.0.xcb);
     }
 
