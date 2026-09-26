@@ -33,29 +33,42 @@ const ROLES = {
   Paragraph: 'paragraph', Row: 'row', Cell: 'cell', Table: 'table', Grid: 'grid', Form: 'form',
 };
 
-let root = null;
-let elements = new Map();
-let act = null;
-let disabled = false;
+const disabled = new URLSearchParams(location.search).get('a11y') === 'off';
+// One mirror per gpui window: the first is the page's main window, every later one an overlay (a menu, a picker, a dialog) drawn on its own canvas, with node ids of its own.
+const windows = new Map();
+let nextWindow = 1;
+function nodeWindow(el) {
+  return windows.get(Number(el.dataset.gpuiWindow));
+}
+function act(el, action) {
+  nodeWindow(el)?.dispatch(el.dataset.gpuiNode, action);
+}
+function findElement(id) {
+  for (const mirror of windows.values()) {
+    for (const el of mirror.elements.values()) if (el.dataset.gpuiId === id) return el;
+  }
+  return null;
+}
 
-export function gpui_a11y_start(dispatch) {
-  disabled = new URLSearchParams(location.search).get('a11y') === 'off';
-  if (disabled) return false;
-  act = dispatch;
-  root = document.createElement('div');
-  root.id = 'gpui-a11y';
+export function gpui_a11y_start(dispatch, canvas, input) {
+  if (disabled) return 0;
+  const key = nextWindow++;
+  const root = document.createElement('div');
+  root.id = key === 1 ? 'gpui-a11y' : `gpui-a11y-${key}`;
+  root.dataset.gpuiA11yRoot = String(key);
   root.setAttribute('role', 'application');
   root.setAttribute('aria-label', 'GPUI');
-  Object.assign(root.style, { position: 'fixed', inset: '0', pointerEvents: 'none', zIndex: '999', overflow: 'hidden' });
+  Object.assign(root.style, { position: 'fixed', inset: '0', pointerEvents: 'none', zIndex: String(999 + key), overflow: 'hidden' });
   document.body.appendChild(root);
-  window.gpuiA11y = {
-    // Dispatch an AccessKit action ("Click", "Focus", "Blur", ...) to the node with this id.
-    act(id, action = 'Click') { act(String(id), action); },
+  windows.set(key, { key, root, canvas, input, dispatch, elements: new Map(), latest: null, timer: null });
+  window.gpuiA11y ??= {
+    // Dispatch an AccessKit action ("Click", "Focus", "Blur", ...) to the node with this id: the main window's ids are plain, an overlay's are `<window>:<id>`.
+    act(id, action = 'Click') { const el = findElement(String(id)); if (el) act(el, action); },
     // The element mirroring a node, for tests that already hold an id.
-    element(id) { return elements.get(String(id)) ?? null; },
-    // Every node as {id, role, label, description, expanded, selected, toggled, bounds}: a cheap snapshot for a test to assert on.
+    element(id) { return findElement(String(id)); },
+    // Every node of every window as {id, role, label, description, expanded, selected, toggled, bounds}: a cheap snapshot for a test to assert on.
     snapshot() {
-      return [...elements.values()].map((el) => ({
+      return [...windows.values()].flatMap((mirror) => [...mirror.elements.values()]).map((el) => ({
         id: el.dataset.gpuiId, role: el.getAttribute('role'), label: el.getAttribute('aria-label') ?? '',
         description: el.getAttribute('aria-description') ?? undefined,
         expanded: el.getAttribute('aria-expanded') ?? undefined, selected: el.getAttribute('aria-selected') ?? undefined,
@@ -64,7 +77,98 @@ export function gpui_a11y_start(dispatch) {
       }));
     },
   };
-  return true;
+  return key;
+}
+
+// A closed window takes its mirror with it.
+export function gpui_a11y_stop(key) {
+  const mirror = windows.get(key);
+  if (!mirror) return;
+  clearTimeout(mirror.timer);
+  mirror.root.remove();
+  windows.delete(key);
+}
+
+// Real pointers pass through the mirror to the canvas, so a click that reaches a mirrored element was dispatched by a script (a test driver's synthetic DOM click). It becomes the node's Click, which gpui answers with a press at the node's centre when the element has no click handler of its own (a menu row that acts on mouse-down).
+function onMirrorClick(event) {
+  event.stopPropagation();
+  act(event.currentTarget, 'Click');
+}
+
+// A wheel event that reaches a mirrored element was dispatched by a script too (a driver scrolling a ref); it is replayed on the element's own canvas, at the event's point or else the element's centre.
+function onMirrorWheel(event) {
+  const el = event.currentTarget;
+  event.preventDefault();
+  event.stopPropagation();
+  const box = el.getBoundingClientRect();
+  const clientX = event.clientX || box.left + box.width / 2;
+  const clientY = event.clientY || box.top + box.height / 2;
+  nodeWindow(el)?.canvas.dispatchEvent(new WheelEvent('wheel', {
+    bubbles: true, cancelable: true, clientX, clientY, deltaX: event.deltaX, deltaY: event.deltaY, deltaMode: event.deltaMode,
+    shiftKey: event.shiftKey, ctrlKey: event.ctrlKey, altKey: event.altKey, metaKey: event.metaKey,
+  }));
+}
+
+// A mirrored text field is focusable and editable so a driver can type into it the way it types into a page: its keys and inserted text are replayed on its window's own input element, which is what gpui reads, after the gpui field has been clicked into focus. The window stays active meanwhile (see gpui_web's blur handler).
+const TEXT_ROLES = new Set(['TextInput', 'MultilineTextInput', 'SearchInput']);
+// Resolves once gpui reports the field focused. Click, not Focus: gpui's text inputs advertise Focus but take it, and their caret, from a click, and it can ignore clicks for a few hundred milliseconds after DOM focus moves onto the mirror, so the click repeats until the mirror reports it. Keyed on the first key rather than on `focus`, which a page in an unfocused window never receives. Timers, not animation frames, which an occluded window never runs.
+const fieldReady = new WeakMap();
+function focusField(el) {
+  if (el.dataset.gpuiFocused === '1') return Promise.resolve();
+  let pending = fieldReady.get(el);
+  if (!pending) {
+    pending = new Promise((resolve) => {
+      let attempts = 0;
+      const attempt = () => {
+        if (el.dataset.gpuiFocused === '1' || attempts >= 8) { fieldReady.delete(el); resolve(); return; }
+        attempts += 1;
+        act(el, 'Click');
+        setTimeout(attempt, 200);
+      };
+      attempt();
+    });
+    fieldReady.set(el, pending);
+  }
+  return pending;
+}
+// Replays run in arrival order, each after the field is focused.
+const replayQueue = new WeakMap();
+function whenFocused(el, replay) {
+  const next = (replayQueue.get(el) ?? Promise.resolve()).then(() => focusField(el)).then(() => replay(nodeWindow(el)?.input));
+  replayQueue.set(el, next);
+}
+function replayKey(input, type, init) {
+  input?.dispatchEvent(new KeyboardEvent(type, { bubbles: true, cancelable: true, ...init }));
+}
+function replayText(input, text) {
+  if (text.length > 0) input?.dispatchEvent(new InputEvent('beforeinput', { bubbles: true, cancelable: true, inputType: 'insertText', data: text }));
+}
+function forwardKey(event) {
+  event.preventDefault();
+  event.stopPropagation();
+  const { type, key, code, shiftKey, ctrlKey, altKey, metaKey, repeat } = event;
+  whenFocused(event.currentTarget, (input) => replayKey(input, type, { key, code, shiftKey, ctrlKey, altKey, metaKey, repeat }));
+}
+function forwardInsertedText(event) {
+  event.preventDefault();
+  const { inputType } = event;
+  const text = event.data ?? '';
+  whenFocused(event.currentTarget, (input) => {
+    const press = (key, shiftKey = false) => {
+      replayKey(input, 'keydown', { key, code: key, shiftKey });
+      replayKey(input, 'keyup', { key, code: key, shiftKey });
+    };
+    if (inputType === 'insertLineBreak' || inputType === 'insertParagraph') press('Enter', true);
+    else if (inputType === 'deleteContentBackward') press('Backspace');
+    else replayText(input, text);
+  });
+}
+// An insertion that raised no cancellable beforeinput (execCommand) lands in the mirror element; it is replayed and cleared.
+function forwardLeftoverText(event) {
+  const el = event.currentTarget;
+  const text = el.textContent ?? '';
+  el.textContent = '';
+  if (text.length > 0) whenFocused(el, (input) => replayText(input, text));
 }
 
 function setAttr(el, name, value) {
@@ -77,30 +181,51 @@ function setAttr(el, name, value) {
 
 // `nodes` is a JSON array of [id, {role, label, description, bounds, expanded, selected, toggled, actions, children}], and `focus` the focused id.
 // gpui sends a tree per drawn frame; the DOM is brought up to date with the latest one at most ten times a second, so a streaming chat does not spend its frames on ARIA attributes.
-let latest = null;
-let flushTimer = null;
-export function gpui_a11y_update(nodesJson, focus, dpr) {
-  if (disabled || root === null) return;
-  latest = [nodesJson, dpr];
-  if (flushTimer === null) {
-    flushTimer = setTimeout(() => { flushTimer = null; const [json, ratio] = latest; latest = null; applyTree(json, ratio); }, 100);
+export function gpui_a11y_update(key, nodesJson, focus, dpr) {
+  const mirror = windows.get(key);
+  if (!mirror) return;
+  mirror.latest = [nodesJson, dpr];
+  if (mirror.timer === null) {
+    mirror.timer = setTimeout(() => {
+      mirror.timer = null;
+      const [json, ratio] = mirror.latest;
+      mirror.latest = null;
+      applyTree(mirror, json, ratio);
+    }, 100);
   }
 }
 
-function applyTree(nodesJson, dpr) {
+function applyTree(mirror, nodesJson, dpr) {
+  const { elements, root } = mirror;
   const nodes = JSON.parse(nodesJson);
   const seen = new Set();
-  const byId = new Map();
-  for (const [id, node] of nodes) byId.set(id, node);
+  // Node bounds are the window's own; an overlay window's canvas sits somewhere on the page.
+  const origin = mirror.canvas.getBoundingClientRect();
   for (const [id, node] of nodes) {
     seen.add(id);
     let el = elements.get(id);
     if (!el) {
       el = document.createElement('div');
-      el.dataset.gpuiId = id;
+      el.dataset.gpuiId = mirror.key === 1 ? id : `${mirror.key}:${id}`;
+      el.dataset.gpuiNode = id;
+      el.dataset.gpuiWindow = String(mirror.key);
       el.style.position = 'fixed';
       el.style.pointerEvents = 'none';
+      el.style.outline = 'none';
+      el.style.color = 'transparent';
+      el.style.caretColor = 'transparent';
+      el.addEventListener('click', onMirrorClick);
+      el.addEventListener('wheel', onMirrorWheel, { passive: false });
       elements.set(id, el);
+    }
+    if (TEXT_ROLES.has(node.role) && !el.dataset.gpuiText) {
+      el.dataset.gpuiText = '1';
+      el.tabIndex = -1;
+      el.contentEditable = 'plaintext-only';
+      el.addEventListener('keydown', forwardKey);
+      el.addEventListener('keyup', forwardKey);
+      el.addEventListener('beforeinput', forwardInsertedText);
+      el.addEventListener('input', forwardLeftoverText);
     }
     setAttr(el, 'role', ROLES[node.role] ?? 'group');
     setAttr(el, 'aria-label', node.label);
@@ -113,9 +238,9 @@ function applyTree(nodesJson, dpr) {
     if (node.focused) el.dataset.gpuiFocused = '1'; else delete el.dataset.gpuiFocused;
     if (node.bounds) {
       const [x0, y0, x1, y1] = node.bounds;
-      const style = `left:${x0 / dpr}px;top:${y0 / dpr}px;width:${(x1 - x0) / dpr}px;height:${(y1 - y0) / dpr}px;`;
+      const style = `left:${origin.left + x0 / dpr}px;top:${origin.top + y0 / dpr}px;width:${(x1 - x0) / dpr}px;height:${(y1 - y0) / dpr}px;`;
       // Fixed, not absolute: the elements nest like the tree, and an absolute child would be placed from its parent's corner instead of the page's.
-      if (el.dataset.gpuiBox !== style) { el.dataset.gpuiBox = style; el.style.cssText = `position:fixed;pointer-events:none;${style}`; }
+      if (el.dataset.gpuiBox !== style) { el.dataset.gpuiBox = style; el.style.cssText = `position:fixed;pointer-events:none;outline:none;color:transparent;caret-color:transparent;${style}`; }
     }
   }
   for (const [id, el] of elements) {
@@ -147,24 +272,43 @@ function applyTree(nodesJson, dpr) {
 }
 "#)]
 extern "C" {
-    fn gpui_a11y_start(dispatch: &Closure<dyn FnMut(String, String)>) -> bool;
-    fn gpui_a11y_update(nodes_json: &str, focus: &str, dpr: f64);
+    fn gpui_a11y_start(
+        dispatch: &Closure<dyn FnMut(String, String)>,
+        canvas: &web_sys::HtmlCanvasElement,
+        input: &web_sys::HtmlTextAreaElement,
+    ) -> u32;
+    fn gpui_a11y_update(window: u32, nodes_json: &str, focus: &str, dpr: f64);
+    fn gpui_a11y_stop(window: u32);
 }
 
+/// One window's mirror; `window` is its key in the page's mirror table, 0 when the mirror is off.
 pub(crate) struct WebA11y {
     callbacks: A11yCallbacks,
     _dispatch: Closure<dyn FnMut(String, String)>,
-    active: bool,
+    window: u32,
+}
+
+impl Drop for WebA11y {
+    fn drop(&mut self) {
+        if self.window != 0 {
+            gpui_a11y_stop(self.window);
+        }
+    }
 }
 
 impl WebA11y {
-    pub(crate) fn start(callbacks: A11yCallbacks) -> Rc<RefCell<Self>> {
+    pub(crate) fn start(
+        callbacks: A11yCallbacks,
+        canvas: &web_sys::HtmlCanvasElement,
+        input: &web_sys::HtmlTextAreaElement,
+    ) -> Rc<RefCell<Self>> {
         let this = Rc::new(RefCell::new(Self {
             callbacks,
             _dispatch: Closure::<dyn FnMut(String, String)>::new(|_, _| {}),
-            active: false,
+            window: 0,
         }));
-        let for_dispatch = Rc::clone(&this);
+        // Weak: the closure lives in the value it points at, and a strong handle would keep a closed window's mirror alive.
+        let for_dispatch = Rc::downgrade(&this);
         let dispatch = Closure::<dyn FnMut(String, String)>::new(move |id: String, action: String| {
             let (Ok(id), Some(action)) = (id.parse::<u64>(), action_from_name(&action)) else {
                 return;
@@ -176,16 +320,18 @@ impl WebA11y {
                 data: None,
             };
             // The callback may re-enter gpui, which may be mid-frame when a test calls in; deliver from the closure's own turn.
-            if let Ok(a11y) = for_dispatch.try_borrow() {
+            if let Some(a11y) = for_dispatch.upgrade()
+                && let Ok(a11y) = a11y.try_borrow()
+            {
                 (a11y.callbacks.action)(request);
             }
         });
-        let started = gpui_a11y_start(&dispatch);
+        let window = gpui_a11y_start(&dispatch, canvas, input);
         {
             let mut a11y = this.borrow_mut();
             a11y._dispatch = dispatch;
-            a11y.active = started;
-            if started {
+            a11y.window = window;
+            if window != 0 {
                 // The page is the assistive client: the tree is wanted from the first frame.
                 (a11y.callbacks.activation)();
             }
@@ -194,7 +340,7 @@ impl WebA11y {
     }
 
     pub(crate) fn tree_update(&self, update: TreeUpdate, dpr: f64) {
-        if !self.active {
+        if self.window == 0 {
             return;
         }
         let mut json = String::from("[");
@@ -252,7 +398,7 @@ impl WebA11y {
             json.push_str("}]");
         }
         json.push(']');
-        gpui_a11y_update(&json, &update.focus.0.to_string(), dpr);
+        gpui_a11y_update(self.window, &json, &update.focus.0.to_string(), dpr);
     }
 }
 

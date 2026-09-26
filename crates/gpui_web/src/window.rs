@@ -820,7 +820,11 @@ impl PlatformWindow for WebWindow {
     }
 
     fn a11y_init(&self, callbacks: gpui::A11yCallbacks) {
-        *self.a11y.borrow_mut() = Some(crate::a11y::WebA11y::start(callbacks));
+        *self.a11y.borrow_mut() = Some(crate::a11y::WebA11y::start(
+            callbacks,
+            &self.inner.canvas,
+            self.inner.ime_mirror.element(),
+        ));
     }
 
     fn a11y_tree_update(&self, tree_update: accesskit::TreeUpdate) {

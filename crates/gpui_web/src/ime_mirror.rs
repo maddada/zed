@@ -268,6 +268,11 @@ impl ImeMirror {
         self.element.selection_start().ok().flatten()
     }
 
+    /// The hidden element that receives this window's keys and text.
+    pub(crate) fn element(&self) -> &web_sys::HtmlTextAreaElement {
+        &self.element
+    }
+
     pub(crate) fn element_selection_end(&self) -> Option<u32> {
         self.element.selection_end().ok().flatten()
     }

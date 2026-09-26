@@ -1178,8 +1178,18 @@ impl WebWindowInner {
 
     fn register_blur(self: &Rc<Self>) -> EventListenerHandle {
         let this = Rc::clone(self);
-        self.listen_input("blur", move |_event: JsValue| {
+        self.listen_input("blur", move |event: JsValue| {
             if this.suppress_focus_status_events.get() {
+                return;
+            }
+            // Focus moving onto this window's accessibility mirror (a driver focusing a mirrored
+            // text field, which replays its keys and text on this input) keeps the window active.
+            let moves_to_mirror = js_sys::Reflect::get(&event, &"relatedTarget".into())
+                .ok()
+                .and_then(|target| target.dyn_into::<web_sys::Element>().ok())
+                .and_then(|target| target.closest("[data-gpui-a11y-root]").ok().flatten())
+                .is_some();
+            if moves_to_mirror {
                 return;
             }
             {

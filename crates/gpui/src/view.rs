@@ -297,6 +297,8 @@ struct ViewElementState {
     paint_range: Range<PaintIndex>,
     cache_key: ViewElementCacheKey,
     accessed_entities: FxHashSet<EntityId>,
+    /// The accessibility subtree the view pushed when it last rendered, if the tree was being built.
+    a11y: Option<crate::window::a11y::A11yCapture>,
 }
 
 struct ViewElementCacheKey {
@@ -487,9 +489,14 @@ fn prepaint_view(
                     && element_state.cache_key.text_style == text_style
                     && !window.dirty_views.contains(&entity_id)
                     && !window.refreshing
+                    && (!window.a11y.is_active() || element_state.a11y.is_some())
                 {
                     let prepaint_start = window.prepaint_index();
                     window.reuse_prepaint(element_state.prepaint_range.clone());
+                    if let Some(capture) = element_state.a11y.as_ref() {
+                        let focus = window.focus;
+                        window.a11y.replay(capture, focus);
+                    }
                     cx.entities
                         .extend_accessed(&element_state.accessed_entities);
                     let prepaint_end = window.prepaint_index();
@@ -500,6 +507,7 @@ fn prepaint_view(
 
                 let refreshing = mem::replace(&mut window.refreshing, true);
                 let prepaint_start = window.prepaint_index();
+                let a11y_start = window.a11y.capture_start();
                 let (element, accessed_entities) = cx.detect_accessed_entities(|cx| {
                     let mut element = render(window, cx);
                     element.layout_as_root(Size::<AvailableSpace>::from(bounds.size), window, cx);
@@ -508,12 +516,14 @@ fn prepaint_view(
                 });
 
                 let prepaint_end = window.prepaint_index();
+                let a11y = a11y_start.map(|start| window.a11y.capture_end(start));
                 window.refreshing = refreshing;
 
                 (
                     Some(element),
                     ViewElementState {
                         accessed_entities,
+                        a11y,
                         prepaint_range: prepaint_start..prepaint_end,
                         paint_range: PaintIndex::default()..PaintIndex::default(),
                         cache_key: ViewElementCacheKey {
