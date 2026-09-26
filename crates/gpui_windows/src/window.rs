@@ -472,6 +472,12 @@ impl WindowsWindow {
         } else {
             None
         };
+        let native_owner_hwnd = if params.kind == WindowKind::PopUp {
+            let owner_window = unsafe { GetActiveWindow() };
+            (!owner_window.is_invalid()).then_some(owner_window)
+        } else {
+            parent_hwnd
+        };
         let hide_title_bar = params
             .titlebar
             .as_ref()
@@ -487,7 +493,11 @@ impl WindowsWindow {
         );
 
         let (mut dwexstyle, dwstyle) = if params.kind == WindowKind::PopUp {
-            (WS_EX_TOOLWINDOW | WS_EX_TOPMOST, WINDOW_STYLE(0x0))
+            let mut dwexstyle = WS_EX_TOOLWINDOW | WS_EX_TOPMOST;
+            if !params.focus {
+                dwexstyle |= WS_EX_NOACTIVATE;
+            }
+            (dwexstyle, WS_POPUP)
         } else {
             let mut dwstyle = WS_SYSMENU;
 
@@ -553,7 +563,7 @@ impl WindowsWindow {
                 CW_USEDEFAULT,
                 CW_USEDEFAULT,
                 CW_USEDEFAULT,
-                parent_hwnd,
+                native_owner_hwnd,
                 None,
                 Some(hinstance.into()),
                 Some(&context as *const _ as *const _),
