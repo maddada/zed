@@ -1207,6 +1207,9 @@ pub struct Window {
     pub(crate) tooltip_bounds: Option<TooltipBounds>,
     tooltip_presenter: Option<TooltipPresenter>,
     tooltip_presentation: Option<(AnyView, Bounds<Pixels>)>,
+    frosted_surface: bool,
+    frosted_regions: Vec<(Bounds<Pixels>, Pixels)>,
+    applied_frosted_regions: Option<Vec<(Bounds<Pixels>, Pixels)>>,
     pub(crate) next_frame_callbacks: Rc<RefCell<Vec<FrameCallback>>>,
     pub(crate) dirty_views: FxHashSet<EntityId>,
     focus_listeners: SubscriberSet<(), AnyWindowFocusListener>,
@@ -2079,6 +2082,9 @@ impl Window {
             tooltip_bounds: None,
             tooltip_presenter: None,
             tooltip_presentation: None,
+            frosted_surface: false,
+            frosted_regions: Vec::new(),
+            applied_frosted_regions: None,
             dirty_views: FxHashSet::default(),
             focus_listeners: SubscriberSet::new(),
             focus_lost_listeners: SubscriberSet::new(),
@@ -2953,6 +2959,33 @@ impl Window {
         self.platform_window.set_background_corner_radius(radius);
     }
 
+    /// Limits a blurred window background to these rounded rectangles, in window coordinates, so a
+    /// window holding several separate cards blurs only behind them. An empty list blurs the whole
+    /// window again.
+    pub fn set_background_blur_region(&self, region: Vec<(Bounds<Pixels>, Pixels)>) {
+        self.platform_window.set_background_blur_region(region);
+    }
+
+    /// Ghostex: marks this window as a frosted surface. Its blurred background is then limited to
+    /// the regions its elements report each frame through [`Window::report_frosted_region`].
+    pub fn set_frosted_surface(&mut self, frosted: bool) {
+        self.frosted_surface = frosted;
+        self.applied_frosted_regions = None;
+        self.refresh();
+    }
+
+    /// Whether this window is a frosted surface (see [`Window::set_frosted_surface`]).
+    pub fn frosted_surface(&self) -> bool {
+        self.frosted_surface
+    }
+
+    /// Adds a rounded rect, in this window's coordinates, to this frame's frosted region.
+    pub fn report_frosted_region(&mut self, bounds: Bounds<Pixels>, corner_radius: Pixels) {
+        if self.frosted_surface {
+            self.frosted_regions.push((bounds, corner_radius));
+        }
+    }
+
     /// Ghostex: hands this window's tooltips to `presenter` instead of painting them. Every drawn
     /// frame calls it once with the tooltip that frame would show (its view and its bounds in this
     /// window), or `None`, so the host can draw it in a window of its own.
@@ -3613,6 +3646,7 @@ impl Window {
         self.invalidator.set_phase(DrawPhase::Prepaint);
         self.tooltip_bounds.take();
         self.tooltip_presentation = None;
+        self.frosted_regions.clear();
 
         self.a11y.sync_active_flag();
         if self.a11y.is_active() {
@@ -3697,6 +3731,14 @@ impl Window {
             drag_element.paint(self, cx);
         } else if let Some(mut tooltip_element) = tooltip_element {
             tooltip_element.paint(self, cx);
+        }
+
+        if self.frosted_surface
+            && self.applied_frosted_regions.as_ref() != Some(&self.frosted_regions)
+        {
+            self.applied_frosted_regions = Some(self.frosted_regions.clone());
+            self.platform_window
+                .set_background_blur_region(self.frosted_regions.clone());
         }
 
         #[cfg(any(feature = "inspector", debug_assertions))]

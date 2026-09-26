@@ -298,6 +298,7 @@ unsafe fn build_classes() {
         };
         BLURRED_VIEW_CLASS = {
             let mut decl = ClassDecl::new("BlurredView", class!(NSVisualEffectView)).unwrap();
+            decl.add_ivar::<id>(BLURRED_VIEW_REGION_MASK_IVAR);
             decl.add_method(
                 sel!(initWithFrame:),
                 blurred_view_init_with_frame as extern "C" fn(&Object, Sel, NSRect) -> id,
@@ -666,6 +667,8 @@ struct MacWindowState {
     native_view: NonNull<Object>,
     blurred_view: Option<id>,
     background_corner_radius: f64,
+    /// Rounded rectangles the blurred background is limited to; empty blurs the whole window.
+    background_blur_region: Vec<(NSRect, f64)>,
     background_appearance: WindowBackgroundAppearance,
     cursor_style: CursorStyle,
     cursor_visible: Arc<AtomicBool>,
@@ -1100,6 +1103,7 @@ impl MacWindow {
                 native_view: NonNull::new_unchecked(native_view),
                 blurred_view: None,
                 background_corner_radius: 0.0,
+                background_blur_region: Vec::new(),
                 background_appearance: WindowBackgroundAppearance::Opaque,
                 cursor_style: CursorStyle::Arrow,
                 cursor_visible,
@@ -1896,6 +1900,7 @@ impl PlatformWindow for MacWindow {
                     relativeTo: nil
                 ];
                 apply_background_corner_radius(blur_view, this.background_corner_radius);
+                apply_background_blur_region(blur_view, &this.background_blur_region);
                 this.blurred_view = Some(blur_view.autorelease());
             }
         }
@@ -1906,6 +1911,32 @@ impl PlatformWindow for MacWindow {
         this.background_corner_radius = f64::from(f32::from(radius));
         if let Some(blur_view) = this.blurred_view {
             unsafe { apply_background_corner_radius(blur_view, this.background_corner_radius) };
+        }
+    }
+
+    fn set_background_blur_region(&self, region: Vec<(Bounds<Pixels>, Pixels)>) {
+        let mut this = self.0.as_ref().lock();
+        let region = region
+            .into_iter()
+            .map(|(bounds, radius)| {
+                (
+                    NSRect::new(
+                        NSPoint::new(
+                            f64::from(f32::from(bounds.origin.x)),
+                            f64::from(f32::from(bounds.origin.y)),
+                        ),
+                        NSSize::new(
+                            f64::from(f32::from(bounds.size.width)),
+                            f64::from(f32::from(bounds.size.height)),
+                        ),
+                    ),
+                    f64::from(f32::from(radius)),
+                )
+            })
+            .collect();
+        this.background_blur_region = region;
+        if let Some(blur_view) = this.blurred_view {
+            unsafe { apply_background_blur_region(blur_view, &this.background_blur_region) };
         }
     }
 
@@ -3819,6 +3850,14 @@ extern "C" fn blurred_view_update_layer(this: &Object, _: Sel) {
             let black: id = msg_send![class!(NSColor), blackColor];
             let black: id = msg_send![black, CGColor];
             let _: () = msg_send![layer, setBackgroundColor: black];
+            // AppKit may rebuild the layer's state here; keep the blur region's mask on it.
+            let mask: id = *this.get_ivar(BLURRED_VIEW_REGION_MASK_IVAR);
+            if !mask.is_null() {
+                let current: id = msg_send![layer, mask];
+                if current != mask {
+                    let _: () = msg_send![layer, setMask: mask];
+                }
+            }
         }
     }
 }
@@ -3833,6 +3872,81 @@ unsafe fn apply_background_corner_radius(blur_view: id, radius: f64) {
         let _: () = msg_send![layer, setCornerRadius: radius];
         let _: () = msg_send![layer, setMasksToBounds: if radius > 0.0 { YES } else { NO }];
     }
+}
+
+/// Holds the `CAShapeLayer` that masks a `BlurredView` to its blur region, or nil.
+const BLURRED_VIEW_REGION_MASK_IVAR: &str = "ghostexRegionMask";
+
+/// Masks the blurred view to rounded rectangles given in the window's top-left coordinates, so a
+/// window holding several separate cards blurs only behind the cards and not the gaps between
+/// them.
+///
+/// CDXC:Theming 2026-09-23 WHY:
+/// The mask is a shape layer on the view's own layer, not `NSVisualEffectView.maskImage`: the mask
+/// image clips only the material's backdrop, and left the black snapshot base this view paints on
+/// its layer covering the whole window, so frosted toasts sat in a black box.
+unsafe fn apply_background_blur_region(blur_view: id, region: &[(NSRect, f64)]) {
+    unsafe {
+        let _: () = msg_send![blur_view, setWantsLayer: YES];
+        let layer: id = msg_send![blur_view, layer];
+        let object = &mut *(blur_view as *mut Object);
+        let previous: id = *object.get_ivar(BLURRED_VIEW_REGION_MASK_IVAR);
+        if region.is_empty() {
+            if !previous.is_null() {
+                if !layer.is_null() {
+                    let _: () = msg_send![layer, setMask: nil];
+                }
+                let _: () = msg_send![previous, release];
+                object.set_ivar::<id>(BLURRED_VIEW_REGION_MASK_IVAR, nil);
+            }
+            return;
+        }
+        let bounds = NSView::bounds(blur_view);
+        let height = bounds.size.height;
+        let cg_path = CGPathCreateMutable();
+        for (rect, radius) in region {
+            // The region is top-down; the layer's own space runs bottom-up.
+            let flipped = NSRect::new(
+                NSPoint::new(rect.origin.x, height - rect.origin.y - rect.size.height),
+                rect.size,
+            );
+            // Core Graphics rejects a corner radius over half the rectangle's shorter side.
+            let radius = radius
+                .min(rect.size.width / 2.0)
+                .min(rect.size.height / 2.0)
+                .max(0.0);
+            CGPathAddRoundedRect(cg_path, ptr::null(), flipped, radius, radius);
+        }
+        let mask: id = if previous.is_null() {
+            let mask: id = msg_send![class!(CAShapeLayer), layer];
+            let _: id = msg_send![mask, retain];
+            object.set_ivar::<id>(BLURRED_VIEW_REGION_MASK_IVAR, mask);
+            mask
+        } else {
+            previous
+        };
+        let _: () = msg_send![class!(CATransaction), begin];
+        let _: () = msg_send![class!(CATransaction), setDisableActions: YES];
+        let _: () = msg_send![mask, setFrame: bounds];
+        let _: () = msg_send![mask, setPath: cg_path];
+        if !layer.is_null() {
+            let _: () = msg_send![layer, setMask: mask];
+        }
+        let _: () = msg_send![class!(CATransaction), commit];
+        CGPathRelease(cg_path);
+    }
+}
+
+unsafe extern "C" {
+    fn CGPathCreateMutable() -> *mut c_void;
+    fn CGPathAddRoundedRect(
+        path: *mut c_void,
+        transform: *const c_void,
+        rect: NSRect,
+        corner_width: f64,
+        corner_height: f64,
+    );
+    fn CGPathRelease(path: *mut c_void);
 }
 
 unsafe fn remove_layer_background(layer: id) {

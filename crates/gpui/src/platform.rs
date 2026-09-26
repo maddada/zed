@@ -940,6 +940,9 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn set_background_appearance(&self, background_appearance: WindowBackgroundAppearance);
     /// Rounds the blurred background's corners, for windows whose content is a rounded card.
     fn set_background_corner_radius(&self, _radius: Pixels) {}
+    /// Limits a blurred background to these rounded rectangles, in window coordinates, for a
+    /// window whose content is several separate cards; an empty list blurs the whole window.
+    fn set_background_blur_region(&self, _region: Vec<(Bounds<Pixels>, Pixels)>) {}
     fn minimize(&self);
     fn zoom(&self);
     fn toggle_fullscreen(&self);
