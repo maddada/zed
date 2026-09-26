@@ -1649,10 +1649,28 @@ impl LinuxClient for X11Client {
         params: WindowParams,
     ) -> anyhow::Result<Box<dyn PlatformWindow>> {
         let mut state = self.0.borrow_mut();
-        let parent_window = state
-            .keyboard_focused_window
-            .and_then(|focused_window| state.windows.get(&focused_window))
-            .map(|w| w.window.clone());
+        #[cfg(target_os = "linux")]
+        let explicit_parent = params.x11_parent;
+        #[cfg(not(target_os = "linux"))]
+        let explicit_parent: Option<AnyWindowHandle> = None;
+        // CDXC:PlatformSupport 2026-09-24 WHY:
+        // Deferred dialogs and hidden pickers must retain their owner even when a CEF child or a closing menu has keyboard focus. A stale explicit owner is an error, not permission to attach to another window.
+        let parent_window = if let Some(parent) = explicit_parent {
+            Some(
+                state
+                    .windows
+                    .values()
+                    .find(|window| window.handle().window_id() == parent.window_id())
+                    .context("X11 transient owner is no longer open")?
+                    .window
+                    .clone(),
+            )
+        } else {
+            state
+                .keyboard_focused_window
+                .and_then(|focused_window| state.windows.get(&focused_window))
+                .map(|w| w.window.clone())
+        };
         let x_window = state
             .xcb_connection
             .generate_id()
