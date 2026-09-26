@@ -228,6 +228,14 @@ unsafe fn build_classes() {
                 set_frame_size as extern "C" fn(&Object, Sel, NSSize),
             );
             decl.add_method(
+                sel!(ghostexSetContentSizeHeld:),
+                set_content_size_held as extern "C" fn(&Object, Sel, BOOL),
+            );
+            decl.add_method(
+                sel!(ghostexSetContentSizeHeldFromLeft:),
+                set_content_size_held_from_left as extern "C" fn(&Object, Sel, BOOL),
+            );
+            decl.add_method(
                 sel!(displayLayer:),
                 display_layer as extern "C" fn(&Object, Sel, id),
             );
@@ -695,6 +703,14 @@ struct MacWindowState {
     /// The blur radius (0 = `BLURRED_VIEW_BLUR_RADIUS`) and whether the backdrop keeps its
     /// saturation (`set_background_blur_style`).
     background_blur_style: (f64, bool),
+    /// The content size GPUI keeps laying out at while an embedder animates the window's frame
+    /// (`ghostexSetContentSizeHeld:`). The drawable keeps this size and is shown pinned to the
+    /// view's right edge, so a window that grows or shrinks from its left edge slides its content
+    /// instead of re-rendering it at every intermediate width.
+    held_content_size: Option<Size<Pixels>>,
+    /// The held content is pinned to the view's left edge instead (`ghostexSetContentSizeHeldFromLeft:`),
+    /// for a window that grows or shrinks from its right edge.
+    held_content_pinned_left: bool,
     /// Rounded rectangles the blurred background is limited to; empty blurs the whole window.
     background_blur_region: Vec<(NSRect, f64)>,
     background_appearance: WindowBackgroundAppearance,
@@ -967,6 +983,9 @@ impl MacWindowState {
     }
 
     fn content_size(&self) -> Size<Pixels> {
+        if let Some(held) = self.held_content_size {
+            return held;
+        }
         let NSSize { width, height, .. } =
             unsafe { NSView::frame(self.native_window.contentView()) }.size;
         size(px(width as f32), px(height as f32))
@@ -1143,6 +1162,8 @@ impl MacWindow {
                 live_view: None,
                 background_corner_radius: 0.0,
                 background_blur_style: (0.0, false),
+                held_content_size: None,
+                held_content_pinned_left: false,
                 background_blur_region: Vec::new(),
                 background_appearance: WindowBackgroundAppearance::Opaque,
                 cursor_style: CursorStyle::Arrow,
@@ -3001,6 +3022,27 @@ extern "C" fn handle_view_event(this: &Object, _: Sel, native_event: id) {
     let event = unsafe { platform_input_from_native(native_event, Some(window_height)) };
 
     if let Some(mut event) = event {
+        // While the content size is held the content is drawn pinned to the view's right edge, so
+        // a pointer position in the narrower view maps that far to the right in GPUI's layout.
+        if let Some(held) = lock
+            .held_content_size
+            .filter(|_| !lock.held_content_pinned_left)
+        {
+            let live_width = unsafe { NSView::frame(lock.native_window.contentView()) }
+                .size
+                .width;
+            let dx = held.width - px(live_width as f32);
+            match &mut event {
+                PlatformInput::MouseDown(event) => event.position.x += dx,
+                PlatformInput::MouseUp(event) => event.position.x += dx,
+                PlatformInput::MouseMove(event) => event.position.x += dx,
+                PlatformInput::MousePressure(event) => event.position.x += dx,
+                PlatformInput::MouseExited(event) => event.position.x += dx,
+                PlatformInput::ScrollWheel(event) => event.position.x += dx,
+                PlatformInput::Pinch(event) => event.position.x += dx,
+                _ => {}
+            }
+        }
         // AppKit unhides the cursor on the next mouse movement; mirror that here.
         if matches!(
             event,
@@ -3684,6 +3726,9 @@ extern "C" fn set_frame_size(this: &Object, _: Sel, size: NSSize) {
     unsafe {
         let _: () = msg_send![super(this, class!(NSView)), setFrameSize: size];
     }
+    if lock.held_content_size.is_some() {
+        return;
+    }
 
     let scale_factor = lock.scale_factor();
     let drawable_size = new_size.to_device_pixels(scale_factor);
@@ -3696,6 +3741,56 @@ extern "C" fn set_frame_size(this: &Object, _: Sel, size: NSSize) {
         callback(content_size, scale_factor);
         window_state.lock().resize_callback = Some(callback);
     };
+}
+
+/// Holds (or releases) the size GPUI lays out at while the embedder animates the window's frame.
+/// Releasing it catches GPUI up with whatever size the view ended at.
+extern "C" fn set_content_size_held(this: &Object, _: Sel, held: BOOL) {
+    hold_content_size(this, held, false);
+}
+
+/// `ghostexSetContentSizeHeld:` for a window that slides in from the right: the held content is
+/// pinned to the view's left edge, which also leaves pointer positions as they are.
+extern "C" fn set_content_size_held_from_left(this: &Object, _: Sel, held: BOOL) {
+    hold_content_size(this, held, true);
+}
+
+fn hold_content_size(this: &Object, held: BOOL, pinned_left: bool) {
+    let window_state = unsafe { get_window_state(this) };
+    let mut lock = window_state.as_ref().lock();
+    let layer = lock.renderer.layer_ptr() as id;
+    if held == YES {
+        if lock.held_content_size.is_none() {
+            let NSSize { width, height, .. } =
+                unsafe { NSView::frame(lock.native_window.contentView()) }.size;
+            lock.held_content_size = Some(size(px(width as f32), px(height as f32)));
+            lock.held_content_pinned_left = pinned_left;
+            let gravity = if pinned_left { "left" } else { "right" };
+            unsafe {
+                let _: () = msg_send![layer, setContentsGravity: ns_string(gravity)];
+            }
+        }
+        return;
+    }
+    lock.held_content_pinned_left = false;
+    let Some(held) = lock.held_content_size.take() else {
+        return;
+    };
+    unsafe {
+        let _: () = msg_send![layer, setContentsGravity: ns_string("resize")];
+    }
+    let content_size = lock.content_size();
+    if content_size == held {
+        return;
+    }
+    let scale_factor = lock.scale_factor();
+    lock.renderer
+        .update_drawable_size(content_size.to_device_pixels(scale_factor));
+    if let Some(mut callback) = lock.resize_callback.take() {
+        drop(lock);
+        callback(content_size, scale_factor);
+        window_state.lock().resize_callback = Some(callback);
+    }
 }
 
 extern "C" fn display_layer(this: &Object, _: Sel, _: id) {
