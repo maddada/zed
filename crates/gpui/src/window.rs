@@ -2019,7 +2019,12 @@ impl Window {
             platform_window.set_app_id(&app_id);
         }
 
-        platform_window.map_window().unwrap();
+        // CDXC:PlatformSupport 2026-09-11 WHY:
+        // Mapping an X11 window makes it visible even when it was created with show=false, so hidden popup preloads must wait for explicit activation.
+        // SEE-ALSO: gpui_linux/src/linux/x11/window.rs (activate maps a hidden window).
+        if show {
+            platform_window.map_window()?;
+        }
 
         Ok(Window {
             handle,

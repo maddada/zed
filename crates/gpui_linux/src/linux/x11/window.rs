@@ -1598,6 +1598,18 @@ impl PlatformWindow for X11Window {
     }
 
     fn activate(&self) {
+        // CDXC:PlatformSupport 2026-09-11 WHY:
+        // Windows created with show=false stay unmapped until activation; requesting focus alone cannot reveal them.
+        // SEE-ALSO: gpui/src/window.rs (initial mapping respects show).
+        if check_reply(
+            || "X11 MapWindow on activation failed.",
+            self.0.xcb.map_window(self.0.x_window),
+        )
+        .log_err()
+        .is_none()
+        {
+            return;
+        }
         let data = [1, xproto::Time::CURRENT_TIME.into(), 0, 0, 0];
         let message = xproto::ClientMessageEvent::new(
             32,
