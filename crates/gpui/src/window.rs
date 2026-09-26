@@ -260,6 +260,10 @@ impl WindowInvalidator {
         mem::take(&mut self.inner.borrow_mut().dirty_views)
     }
 
+    pub fn view_is_dirty(&self, view: EntityId) -> bool {
+        self.inner.borrow().dirty_views.contains(&view)
+    }
+
     pub fn replace_views(&self, views: FxHashSet<EntityId>) {
         self.inner.borrow_mut().dirty_views = views;
     }
@@ -2609,6 +2613,20 @@ impl Window {
     /// await points in async code.
     pub fn to_async(&self, cx: &App) -> AsyncWindowContext {
         AsyncWindowContext::new_context(cx.to_async(), self.handle)
+    }
+
+    /// Whether `view` has been notified since it was last drawn, so the next draw renders it again
+    /// regardless of what else asks for a frame.
+    pub fn view_is_pending_render(&self, view: EntityId) -> bool {
+        self.invalidator.view_is_dirty(view) || self.dirty_views.contains(&view)
+    }
+
+    /// Renders `view` in the frame being drawn even if it was drawn cached and nothing notified it.
+    ///
+    /// For a view that is rendering and knows a cached descendant must follow it this frame:
+    /// notifying the descendant from inside a draw only reaches the frame after this one.
+    pub fn render_view_this_frame(&mut self, view: EntityId) {
+        self.dirty_views.insert(view);
     }
 
     /// Schedule the given closure to be run directly after the current frame is rendered.
