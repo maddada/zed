@@ -1008,6 +1008,8 @@ pub(super) fn cursor_style_to_icon_names(style: CursorStyle) -> &'static [&'stat
         CursorStyle::DragLink => &["alias"],
         CursorStyle::DragCopy => &["copy"],
         CursorStyle::ContextualMenu => &["context-menu"],
+        CursorStyle::ZoomIn => &["zoom-in"],
+        CursorStyle::ZoomOut => &["zoom-out"],
     }
 }
 

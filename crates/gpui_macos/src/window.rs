@@ -2551,10 +2551,29 @@ extern "C" fn reset_cursor_rects(this: &Object, _: Sel) {
             CursorStyle::DragLink => msg_send![class!(NSCursor), dragLinkCursor],
             CursorStyle::DragCopy => msg_send![class!(NSCursor), dragCopyCursor],
             CursorStyle::ContextualMenu => msg_send![class!(NSCursor), contextualMenuCursor],
+
+            // Public class methods since macOS 15, private ones before it; a system with neither
+            // keeps the arrow rather than raising an unrecognized selector.
+            CursorStyle::ZoomIn => zoom_cursor(sel!(zoomInCursor), sel!(_zoomInCursor)),
+            CursorStyle::ZoomOut => zoom_cursor(sel!(zoomOutCursor), sel!(_zoomOutCursor)),
         };
 
         let bounds = NSView::bounds(this as *const Object as id);
         let _: () = msg_send![this, addCursorRect: bounds cursor: cursor];
+    }
+}
+
+/// One of `NSCursor`'s zoom cursors, or the arrow on a system whose AppKit has neither.
+unsafe fn zoom_cursor(public: Sel, private: Sel) -> id {
+    unsafe {
+        let class = class!(NSCursor);
+        for selector in [public, private] {
+            let responds: BOOL = msg_send![class, respondsToSelector: selector];
+            if responds == YES {
+                return msg_send![class, performSelector: selector];
+            }
+        }
+        msg_send![class, arrowCursor]
     }
 }
 
