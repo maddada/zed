@@ -659,6 +659,8 @@ impl PlatformWindow for WindowsWindow {
         self.state.content_size()
     }
 
+    /// CDXC:PlatformSupport 2026-09-23 WHY:
+    /// Resizing a hover-reveal popup must preserve focus and stacking. SetWindowPos otherwise activates and raises it on every animation frame, dismissing the reveal when its main window loses focus and stealing keys from the intended window.
     fn resize(&mut self, size: Size<Pixels>) {
         let hwnd = self.0.hwnd;
         let bounds = gpui::bounds(self.bounds().origin, size).to_device_pixels(self.scale_factor());
@@ -675,7 +677,7 @@ impl PlatformWindow for WindowsWindow {
                         bounds.origin.y.0,
                         rect.right - rect.left,
                         rect.bottom - rect.top,
-                        SWP_NOMOVE,
+                        SWP_NOMOVE | SWP_NOACTIVATE | SWP_NOZORDER,
                     )
                     .context("unable to set window content size")
                     .log_err();
