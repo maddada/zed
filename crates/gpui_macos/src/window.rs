@@ -3813,6 +3813,12 @@ extern "C" fn blurred_view_update_layer(this: &Object, _: Sel) {
         let layer: id = msg_send![this, layer];
         if !layer.is_null() {
             remove_layer_background(layer);
+            // Window snapshots (Mission Control, the app switcher's previews) drop backdrop
+            // layers, so with every background stripped the window would show there as nothing
+            // at all. The live blur covers this base everywhere else.
+            let black: id = msg_send![class!(NSColor), blackColor];
+            let black: id = msg_send![black, CGColor];
+            let _: () = msg_send![layer, setBackgroundColor: black];
         }
     }
 }
