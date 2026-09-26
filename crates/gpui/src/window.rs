@@ -1567,6 +1567,7 @@ impl Window {
                 show,
                 display_id,
                 window_min_size,
+                window_background,
                 app_id: app_id.clone(),
                 icon,
                 #[cfg(target_os = "macos")]

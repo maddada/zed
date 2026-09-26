@@ -2317,6 +2317,11 @@ pub struct WindowParams {
 
     pub window_min_size: Option<Size<Pixels>>,
 
+    /// The requested background appearance, known before the platform window exists.
+    /// Windows picks its compositing path from it at creation time.
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    pub window_background: WindowBackgroundAppearance,
+
     #[cfg(target_os = "macos")]
     pub tabbing_identifier: Option<String>,
 }

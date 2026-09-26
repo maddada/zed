@@ -457,6 +457,12 @@ impl WindowsWindow {
             invalidate_devices,
             draw_coordinator,
         } = creation_info;
+        // CDXC:PlatformSupport 2026-09-18 WHY:
+        // GPUI_DISABLE_DIRECT_COMPOSITION is for windows that host child HWNDs (windowed CEF), which DWM can only composite into a redirection bitmap.
+        // That path presents through CreateSwapChainForHwnd with DXGI_ALPHA_MODE_IGNORE, so transparent and blurred popups drew solid black where they should show through.
+        // Only opaque windows honour the disable; windows that need per-pixel alpha keep DirectComposition, as they already get alpha on macOS.
+        let disable_direct_composition = disable_direct_composition
+            && params.window_background == WindowBackgroundAppearance::Opaque;
         register_window_class(icon);
         let parent_hwnd = if params.kind == WindowKind::Dialog {
             let parent_window = unsafe { GetActiveWindow() };
