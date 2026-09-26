@@ -955,6 +955,9 @@ impl TooltipId {
     }
 }
 
+/// Ghostex: receives the tooltip a frame would show, see [`Window::set_tooltip_presenter`].
+pub type TooltipPresenter = Rc<dyn Fn(Option<(AnyView, Bounds<Pixels>)>, &mut App)>;
+
 pub(crate) struct TooltipBounds {
     id: TooltipId,
     bounds: Bounds<Pixels>,
@@ -1202,6 +1205,8 @@ pub struct Window {
     next_hitbox_id: HitboxId,
     pub(crate) next_tooltip_id: TooltipId,
     pub(crate) tooltip_bounds: Option<TooltipBounds>,
+    tooltip_presenter: Option<TooltipPresenter>,
+    tooltip_presentation: Option<(AnyView, Bounds<Pixels>)>,
     pub(crate) next_frame_callbacks: Rc<RefCell<Vec<FrameCallback>>>,
     pub(crate) dirty_views: FxHashSet<EntityId>,
     focus_listeners: SubscriberSet<(), AnyWindowFocusListener>,
@@ -2072,6 +2077,8 @@ impl Window {
             next_hitbox_id: HitboxId(0),
             next_tooltip_id: TooltipId::default(),
             tooltip_bounds: None,
+            tooltip_presenter: None,
+            tooltip_presentation: None,
             dirty_views: FxHashSet::default(),
             focus_listeners: SubscriberSet::new(),
             focus_lost_listeners: SubscriberSet::new(),
@@ -2940,6 +2947,25 @@ impl Window {
             .set_background_appearance(background_appearance);
     }
 
+    /// Ghostex: hands this window's tooltips to `presenter` instead of painting them. Every drawn
+    /// frame calls it once with the tooltip that frame would show (its view and its bounds in this
+    /// window), or `None`, so the host can draw it in a window of its own.
+    pub fn set_tooltip_presenter(&mut self, presenter: Option<TooltipPresenter>) {
+        self.tooltip_presenter = presenter;
+        self.refresh();
+    }
+
+    /// Whether this window's tooltips go to a presenter (see [`Window::set_tooltip_presenter`]).
+    pub fn tooltip_presenter_active(&self) -> bool {
+        self.tooltip_presenter.is_some()
+    }
+
+    /// Ghostex: a tooltip drawn outside the stock tooltip path (a managed overlay) reports itself
+    /// here while a presenter is set, instead of painting.
+    pub fn present_tooltip(&mut self, view: AnyView, bounds: Bounds<Pixels>) {
+        self.tooltip_presentation = Some((view, bounds));
+    }
+
     /// Mark the window as dirty at the platform level.
     pub fn set_window_edited(&mut self, edited: bool) {
         self.platform_window.set_edited(edited);
@@ -3580,6 +3606,7 @@ impl Window {
     fn draw_roots(&mut self, cx: &mut App) {
         self.invalidator.set_phase(DrawPhase::Prepaint);
         self.tooltip_bounds.take();
+        self.tooltip_presentation = None;
 
         self.a11y.sync_active_flag();
         if self.a11y.is_active() {
@@ -3642,6 +3669,9 @@ impl Window {
             cx.active_drag = Some(active_drag);
         } else {
             tooltip_element = self.prepaint_tooltip(cx);
+        }
+        if let Some(presenter) = self.tooltip_presenter.clone() {
+            presenter(self.tooltip_presentation.take(), cx);
         }
 
         self.mouse_hit_test = self.pointer_hit_test(&self.next_frame);
@@ -3772,6 +3802,16 @@ impl Window {
                 (tooltip_request.tooltip.check_visible_and_update)(tooltip_bounds, self, cx);
             if !is_visible {
                 continue;
+            }
+
+            if self.tooltip_presenter.is_some() {
+                self.tooltip_bounds = Some(TooltipBounds {
+                    id: tooltip_request.id,
+                    bounds: tooltip_bounds,
+                });
+                self.tooltip_presentation =
+                    Some((tooltip_request.tooltip.view.clone(), tooltip_bounds));
+                return None;
             }
 
             self.with_absolute_element_offset(tooltip_bounds.origin, |window| {
