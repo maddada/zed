@@ -665,6 +665,7 @@ struct MacWindowState {
     native_window: id,
     native_view: NonNull<Object>,
     blurred_view: Option<id>,
+    background_corner_radius: f64,
     background_appearance: WindowBackgroundAppearance,
     cursor_style: CursorStyle,
     cursor_visible: Arc<AtomicBool>,
@@ -1098,6 +1099,7 @@ impl MacWindow {
                 native_window,
                 native_view: NonNull::new_unchecked(native_view),
                 blurred_view: None,
+                background_corner_radius: 0.0,
                 background_appearance: WindowBackgroundAppearance::Opaque,
                 cursor_style: CursorStyle::Arrow,
                 cursor_visible,
@@ -1893,8 +1895,17 @@ impl PlatformWindow for MacWindow {
                     positioned: NSWindowOrderingMode::NSWindowBelow
                     relativeTo: nil
                 ];
+                apply_background_corner_radius(blur_view, this.background_corner_radius);
                 this.blurred_view = Some(blur_view.autorelease());
             }
+        }
+    }
+
+    fn set_background_corner_radius(&self, radius: Pixels) {
+        let mut this = self.0.as_ref().lock();
+        this.background_corner_radius = f64::from(f32::from(radius));
+        if let Some(blur_view) = this.blurred_view {
+            unsafe { apply_background_corner_radius(blur_view, this.background_corner_radius) };
         }
     }
 
@@ -3803,6 +3814,18 @@ extern "C" fn blurred_view_update_layer(this: &Object, _: Sel) {
         if !layer.is_null() {
             remove_layer_background(layer);
         }
+    }
+}
+
+unsafe fn apply_background_corner_radius(blur_view: id, radius: f64) {
+    unsafe {
+        let _: () = msg_send![blur_view, setWantsLayer: YES];
+        let layer: id = msg_send![blur_view, layer];
+        if layer.is_null() {
+            return;
+        }
+        let _: () = msg_send![layer, setCornerRadius: radius];
+        let _: () = msg_send![layer, setMasksToBounds: if radius > 0.0 { YES } else { NO }];
     }
 }
 

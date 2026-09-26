@@ -2947,6 +2947,12 @@ impl Window {
             .set_background_appearance(background_appearance);
     }
 
+    /// Rounds the corners of a blurred window background to match rounded content, so the blur
+    /// does not show as a square behind a card's corners.
+    pub fn set_background_corner_radius(&self, radius: Pixels) {
+        self.platform_window.set_background_corner_radius(radius);
+    }
+
     /// Ghostex: hands this window's tooltips to `presenter` instead of painting them. Every drawn
     /// frame calls it once with the tooltip that frame would show (its view and its bounds in this
     /// window), or `None`, so the host can draw it in a window of its own.
