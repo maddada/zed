@@ -22,7 +22,7 @@ use crate::{
     TextInputStateChange, TextRenderingMode, TextStyle, TextStyleRefinement, ThermalState,
     TransformationMatrix, Underline, UnderlineStyle, WindowAppearance, WindowBackgroundAppearance,
     WindowBounds, WindowControls, WindowDecorations, WindowOptions, WindowParams, WindowTextSystem,
-    WindowVisibility, point, prelude::*, px, rems, size, transparent_black,
+    WindowVisibility, div, point, prelude::*, px, rems, size, transparent_black,
 };
 
 use crate::gestures::{GestureTuning, RecognizedTouchGesture, TouchGestureRecognizer};
@@ -64,9 +64,11 @@ use std::{
 use uuid::Uuid;
 
 pub(crate) mod a11y;
+mod native_occlusions;
 mod prompts;
 
 pub use a11y::A11ySubtreeBuilder;
+pub use native_occlusions::{native_occlusion_row_gap, nudge_out_of_native_occlusions};
 
 use self::a11y::A11y;
 use self::a11y::ROOT_NODE_ID;
@@ -992,6 +994,8 @@ pub(crate) struct Frame {
     pub(crate) input_handlers: Vec<Option<PlatformInputHandler>>,
     pub(crate) tooltip_requests: Vec<Option<TooltipRequest>>,
     pub(crate) cursor_styles: Vec<CursorStyleRequest>,
+    /// Regions native child views cover this frame; see `Window::occlude_native_region`.
+    pub(crate) native_occlusions: Vec<Bounds<Pixels>>,
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) debug_bounds: FxHashMap<String, Bounds<Pixels>>,
     #[cfg(any(test, feature = "test-support"))]
@@ -1007,6 +1011,7 @@ pub(crate) struct Frame {
 pub(crate) struct PrepaintStateIndex {
     hitboxes_index: usize,
     tooltips_index: usize,
+    native_occlusions_index: usize,
     deferred_draws_index: usize,
     dispatch_tree_index: usize,
     accessed_element_states_index: usize,
@@ -1047,6 +1052,7 @@ impl Frame {
             deferred_draws: Vec::new(),
             input_handlers: Vec::new(),
             tooltip_requests: Vec::new(),
+            native_occlusions: Vec::new(),
             cursor_styles: Vec::new(),
 
             #[cfg(any(test, feature = "test-support"))]
@@ -1072,6 +1078,7 @@ impl Frame {
         self.input_handlers.clear();
         self.tooltip_requests.clear();
         self.cursor_styles.clear();
+        self.native_occlusions.clear();
         self.hitboxes.clear();
         self.window_control_hitboxes.clear();
         self.deferred_draws.clear();
@@ -3701,23 +3708,42 @@ impl Window {
             };
             let mut element = tooltip_request.tooltip.view.clone().into_any_element();
             let mouse_position = tooltip_request.tooltip.mouse_position;
-            let tooltip_size = element.layout_as_root(AvailableSpace::min_size(), self, cx);
-
-            let mut tooltip_bounds =
-                Bounds::new(mouse_position + point(px(1.), px(1.)), tooltip_size);
             let window_bounds = Bounds {
                 origin: Point::default(),
                 size: self.viewport_size(),
             };
 
-            if tooltip_bounds.right() > window_bounds.right() {
+            // CDXC:Tooltips 2026-09-24 DECISION:
+            // User: a tooltip that leaves its pane "can end up cut off under the CEF pane if it's next to the one we're in"; tooltips must dodge the frames native views cover (they draw over everything GPUI paints) rather than stay inside their own pane, and one wider than the room next to its trigger wraps to that room instead of being shortened. The region's edge on the pointer's row is treated like a window edge: the tooltip flips to the pointer's other side first, then shifts, and the element is laid out inside a box no wider than the room so its text wraps.
+            let occlusions = self.next_frame.native_occlusions.clone();
+            let mut left_limit = Pixels::ZERO;
+            let mut right_limit = window_bounds.right();
+            if !occlusions.is_empty() {
+                let gap = native_occlusion_row_gap(
+                    Bounds::new(mouse_position, size(px(1.), px(1.))),
+                    &occlusions,
+                    window_bounds.size,
+                );
+                left_limit = gap.start;
+                right_limit = gap.end;
+                let room = right_limit - left_limit - px(2.);
+                if room > Pixels::ZERO {
+                    element = div().flex().max_w(room).child(element).into_any_element();
+                }
+            }
+            let tooltip_size = element.layout_as_root(AvailableSpace::min_size(), self, cx);
+
+            let mut tooltip_bounds =
+                Bounds::new(mouse_position + point(px(1.), px(1.)), tooltip_size);
+
+            if tooltip_bounds.right() > right_limit {
                 let new_x = mouse_position.x - tooltip_bounds.size.width - px(1.);
-                if new_x >= Pixels::ZERO {
+                if new_x >= left_limit {
                     tooltip_bounds.origin.x = new_x;
                 } else {
                     tooltip_bounds.origin.x = cmp::max(
-                        Pixels::ZERO,
-                        tooltip_bounds.origin.x - tooltip_bounds.right() - window_bounds.right(),
+                        left_limit,
+                        tooltip_bounds.origin.x - tooltip_bounds.right() - right_limit,
                     );
                 }
             }
@@ -3732,6 +3758,11 @@ impl Window {
                         tooltip_bounds.origin.y - tooltip_bounds.bottom() - window_bounds.bottom(),
                     );
                 }
+            }
+
+            if !occlusions.is_empty() {
+                tooltip_bounds =
+                    nudge_out_of_native_occlusions(tooltip_bounds, &occlusions, window_bounds);
             }
 
             // It's possible for an element to have an active tooltip while not being painted (e.g.
@@ -3876,6 +3907,7 @@ impl Window {
         PrepaintStateIndex {
             hitboxes_index: self.next_frame.hitboxes.len(),
             tooltips_index: self.next_frame.tooltip_requests.len(),
+            native_occlusions_index: self.next_frame.native_occlusions.len(),
             deferred_draws_index: self.next_frame.deferred_draws.len(),
             dispatch_tree_index: self.next_frame.dispatch_tree.len(),
             accessed_element_states_index: self.next_frame.accessed_element_states.len(),
@@ -3894,6 +3926,12 @@ impl Window {
                 [range.start.tooltips_index..range.end.tooltips_index]
                 .iter_mut()
                 .map(|request| request.take()),
+        );
+        self.next_frame.native_occlusions.extend(
+            self.rendered_frame.native_occlusions
+                [range.start.native_occlusions_index..range.end.native_occlusions_index]
+                .iter()
+                .cloned(),
         );
         self.next_frame.accessed_element_states.extend(
             self.rendered_frame.accessed_element_states[range.start.accessed_element_states_index
