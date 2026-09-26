@@ -1200,6 +1200,9 @@ pub struct Window {
     default_prevented: bool,
     mouse_position: Point<Pixels>,
     mouse_hit_test: HitTest,
+    /// Set when the pointer leaves the window and cleared by the next event that places it inside
+    /// again: while set nothing in the window is under the pointer.
+    pointer_left_window: bool,
     modifiers: Modifiers,
     capslock: Capslock,
     scale_factor: f32,
@@ -2056,6 +2059,7 @@ impl Window {
             default_prevented: true,
             mouse_position,
             mouse_hit_test: HitTest::default(),
+            pointer_left_window: false,
             modifiers,
             capslock,
             scale_factor,
@@ -3565,7 +3569,7 @@ impl Window {
             tooltip_element = self.prepaint_tooltip(cx);
         }
 
-        self.mouse_hit_test = self.next_frame.hit_test(self.mouse_position);
+        self.mouse_hit_test = self.pointer_hit_test(&self.next_frame);
 
         // Now actually paint the elements.
         self.invalidator.set_phase(DrawPhase::Paint);
@@ -5422,6 +5426,18 @@ impl Window {
             self.refresh();
         }
 
+        if matches!(
+            event,
+            PlatformInput::MouseMove(_)
+                | PlatformInput::MouseDown(_)
+                | PlatformInput::MouseUp(_)
+                | PlatformInput::ScrollWheel(_)
+                | PlatformInput::Pinch(_)
+                | PlatformInput::FileDrop(_)
+        ) {
+            self.pointer_left_window = false;
+        }
+
         // Handlers may set this to false by calling `stop_propagation`.
         cx.propagate_event = true;
         // Handlers may set this to true by calling `prevent_default`.
@@ -5448,8 +5464,14 @@ impl Window {
             PlatformInput::MousePressure(mouse_pressure) => {
                 PlatformInput::MousePressure(mouse_pressure)
             }
+            // CDXC:PlatformSupport 2026-09-26 WHY:
+            // Moving from a GPUI element into a native child view (macOS NSView, Windows child HWND) ends mouse tracking without another mouse move, so the hit test stayed on the element last under the pointer and its `.hover()` style never cleared.
+            // Following the exit position instead (the 2026-09-19 fix) re-hovered whatever GPUI element lies under the child view or at the window's edge on the next frame, and broke upstream's rule that a MouseExited leaves hover listeners unhovered; nothing is under the pointer until it comes back.
             PlatformInput::MouseExited(mouse_exited) => {
+                self.mouse_position = mouse_exited.position;
                 self.modifiers = mouse_exited.modifiers;
+                self.pointer_left_window = true;
+                self.refresh();
                 PlatformInput::MouseExited(mouse_exited)
             }
             PlatformInput::ModifiersChanged(modifiers_changed) => {
@@ -5741,8 +5763,17 @@ impl Window {
         });
     }
 
+    /// What is under the pointer in `frame`: nothing while the pointer is outside the window.
+    fn pointer_hit_test(&self, frame: &Frame) -> HitTest {
+        if self.pointer_left_window {
+            HitTest::default()
+        } else {
+            frame.hit_test(self.mouse_position)
+        }
+    }
+
     fn dispatch_mouse_event(&mut self, event: &dyn Any, cx: &mut App) {
-        let hit_test = self.rendered_frame.hit_test(self.mouse_position());
+        let hit_test = self.pointer_hit_test(&self.rendered_frame);
         if hit_test != self.mouse_hit_test {
             self.mouse_hit_test = hit_test;
             self.reset_cursor_style(cx);
