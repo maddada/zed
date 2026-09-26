@@ -351,6 +351,16 @@ unsafe fn update_player(player: id) {
 unsafe fn view_wants_play(view: id) -> bool {
     unsafe {
         let window: id = msg_send![view, window];
+        let object = &*(view as *const Object);
+        let only_on_power = *object.get_ivar::<BOOL>("gpuiOnlyOnPower") == YES;
+        window_may_animate(window, only_on_power)
+    }
+}
+
+/// Whether a moving backdrop in `window` may move right now: someone can see it, and nothing asks
+/// it to hold still. The live backdrop (window_live.rs) moves under exactly the same rules.
+pub(crate) unsafe fn window_may_animate(window: id, only_on_power: bool) -> bool {
+    unsafe {
         if window == nil {
             return false;
         }
@@ -362,8 +372,6 @@ unsafe fn view_wants_play(view: id) -> bool {
         let visible = occlusion & (1 << 1) != 0;
         let process: id = msg_send![class!(NSProcessInfo), processInfo];
         let low_power: BOOL = msg_send![process, isLowPowerModeEnabled];
-        let object = &*(view as *const Object);
-        let only_on_power = *object.get_ivar::<BOOL>("gpuiOnlyOnPower") == YES;
         active == YES
             && miniaturized == NO
             && visible
@@ -374,7 +382,7 @@ unsafe fn view_wants_play(view: id) -> bool {
     }
 }
 
-unsafe fn reduce_motion() -> bool {
+pub(crate) unsafe fn reduce_motion() -> bool {
     unsafe {
         let workspace: id = msg_send![class!(NSWorkspace), sharedWorkspace];
         let reduce: BOOL = msg_send![workspace, accessibilityDisplayShouldReduceMotion];
@@ -426,7 +434,7 @@ fn view_class() -> *const Class {
 /// Everything that decides whether the video can be seen or should move: the app coming to or
 /// leaving the front, a window hidden, covered or minimised, the displays sleeping, Low Power
 /// Mode, Reduce Motion. Screens and Spaces changing re-place the video like the picture.
-unsafe fn observe_conditions(view: id) {
+pub(crate) unsafe fn observe_conditions(view: id) {
     unsafe {
         let center: id = msg_send![class!(NSNotificationCenter), defaultCenter];
         for name in [
@@ -465,7 +473,7 @@ unsafe fn observe_conditions(view: id) {
     }
 }
 
-unsafe fn stop_observing_conditions(view: id) {
+pub(crate) unsafe fn stop_observing_conditions(view: id) {
     unsafe {
         let center: id = msg_send![class!(NSNotificationCenter), defaultCenter];
         let _: () = msg_send![center, removeObserver: view];
@@ -477,7 +485,7 @@ unsafe fn stop_observing_conditions(view: id) {
 
 /// Plugging in or unplugging the charger, through IOKit's power source notification on the main
 /// run loop. Registered once for the whole app.
-fn observe_power_source() {
+pub(crate) fn observe_power_source() {
     POWER_SOURCE_OBSERVED.get_or_init(|| unsafe {
         let source =
             IOPSNotificationCreateRunLoopSource(power_source_did_change, std::ptr::null_mut());
@@ -492,9 +500,31 @@ extern "C" fn power_source_did_change(_: *mut c_void) {
     for view in views {
         unsafe { refresh(view as id) };
     }
+    crate::window_live::refresh_all();
 }
 
 extern "C" fn video_conditions_did_change(this: &Object, _: Sel, notification: id) {
+    unsafe {
+        let this_id = this as *const Object as id;
+        note_condition_notification(this_id, notification);
+        // Low Power Mode changes arrive on a background queue.
+        let main: BOOL = msg_send![class!(NSThread), isMainThread];
+        if main == YES {
+            refresh(this_id);
+        } else {
+            let _: () = msg_send![
+                this_id,
+                performSelectorOnMainThread: sel!(refreshVideoPlayback)
+                withObject: nil
+                waitUntilDone: NO
+            ];
+        }
+    }
+}
+
+/// What every moving backdrop does with one of the notifications `observe_conditions` registers:
+/// tracks the displays sleeping, and re-places its window's backdrop when screens or Spaces change.
+pub(crate) unsafe fn note_condition_notification(view: id, notification: id) {
     unsafe {
         let name: id = if notification == nil {
             nil
@@ -514,27 +544,13 @@ extern "C" fn video_conditions_did_change(this: &Object, _: Sel, notification: i
             if is(NSApplicationDidChangeScreenParametersNotification)
                 || is(NSWorkspaceActiveSpaceDidChangeNotification)
             {
-                let this_id = this as *const Object as id;
-                let _: id = msg_send![this_id, retain];
-                let _: id = msg_send![this_id, autorelease];
-                let window: id = msg_send![this_id, window];
+                let _: id = msg_send![view, retain];
+                let _: id = msg_send![view, autorelease];
+                let window: id = msg_send![view, window];
                 if window != nil {
                     crate::window::refresh_window_backdrop(&*window);
                 }
             }
-        }
-        // Low Power Mode changes arrive on a background queue.
-        let this_id = this as *const Object as id;
-        let main: BOOL = msg_send![class!(NSThread), isMainThread];
-        if main == YES {
-            refresh(this_id);
-        } else {
-            let _: () = msg_send![
-                this_id,
-                performSelectorOnMainThread: sel!(refreshVideoPlayback)
-                withObject: nil
-                waitUntilDone: NO
-            ];
         }
     }
 }

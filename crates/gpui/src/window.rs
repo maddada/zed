@@ -2591,6 +2591,14 @@ impl Window {
             .set_background_video(video, only_on_power);
     }
 
+    /// Ghostex: makes a wallpaper background draw an animated live style instead of its picture or
+    /// video. It stops moving under the same conditions as the video (nobody can see it, Low Power
+    /// Mode, battery when `only_on_power` is set) and shows a still frame under Reduce Motion. A
+    /// style the platform does not draw leaves the live blur; `None` goes back to the picture.
+    pub fn set_background_live(&self, live: Option<crate::LiveBackground>) {
+        self.platform_window.set_background_live(live);
+    }
+
     /// Mark the window as dirty at the platform level.
     pub fn set_window_edited(&mut self, edited: bool) {
         self.platform_window.set_edited(edited);

@@ -772,6 +772,9 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     /// `None` goes back to the picture. `only_on_power` pauses it while the computer runs on
     /// battery.
     fn set_background_video(&self, _video: Option<std::path::PathBuf>, _only_on_power: bool) {}
+    /// An animated backdrop a wallpaper background draws in place of its picture or video; `None`
+    /// goes back to them.
+    fn set_background_live(&self, _live: Option<LiveBackground>) {}
     fn minimize(&self);
     fn zoom(&self);
     fn toggle_fullscreen(&self);
@@ -2004,6 +2007,22 @@ pub enum WindowBackgroundAppearance {
     MicaBackdrop,
     /// The Mica Alt backdrop material, supported on Windows 11.
     MicaAltBackdrop,
+}
+
+/// Ghostex: an animated backdrop the platform draws behind a wallpaper background in place of a
+/// picture or video: one of the platform's live styles, painted in the given colours.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LiveBackground {
+    /// The style's id; a style the platform does not draw leaves the live blur.
+    pub style: SharedString,
+    /// The colours it paints with, from the deepest to the brightest, as sRGB components in 0-1.
+    pub colors: [[f32; 3]; 3],
+    /// How fast it moves; 1 is the style's own pace.
+    pub speed: f32,
+    /// How bright it is drawn, 0-1: lower dims it toward its deepest colour.
+    pub brightness: f32,
+    /// Stop moving while the computer runs on battery.
+    pub only_on_power: bool,
 }
 
 /// The text rendering mode to use for drawing glyphs.
