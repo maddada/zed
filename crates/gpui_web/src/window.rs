@@ -101,6 +101,7 @@ pub(crate) enum WebWindowRole {
 
 pub struct WebWindow {
     inner: Rc<WebWindowInner>,
+    a11y: RefCell<Option<Rc<RefCell<crate::a11y::WebA11y>>>>,
     handle: AnyWindowHandle,
     display: Rc<dyn PlatformDisplay>,
     role: WebWindowRole,
@@ -337,6 +338,7 @@ impl WebWindow {
 
         Ok(Self {
             inner,
+            a11y: RefCell::new(None),
             handle,
             display,
             role,
@@ -815,6 +817,17 @@ impl PlatformWindow for WebWindow {
 
     fn scale_factor(&self) -> f32 {
         self.inner.state.borrow().scale_factor
+    }
+
+    fn a11y_init(&self, callbacks: gpui::A11yCallbacks) {
+        *self.a11y.borrow_mut() = Some(crate::a11y::WebA11y::start(callbacks));
+    }
+
+    fn a11y_tree_update(&self, tree_update: accesskit::TreeUpdate) {
+        let dpr = f64::from(self.inner.state.borrow().scale_factor);
+        if let Some(a11y) = self.a11y.borrow().as_ref() {
+            a11y.borrow().tree_update(tree_update, dpr);
+        }
     }
 
     fn appearance(&self) -> WindowAppearance {

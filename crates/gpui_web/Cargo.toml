@@ -24,6 +24,7 @@ unicode-segmentation = "1.10"
 
 [target.'cfg(target_family = "wasm")'.dependencies]
 gpui.workspace = true
+accesskit.workspace = true
 scheduler.workspace = true
 parking_lot = { workspace = true, features = ["nightly"] }
 gpui_wgpu.workspace = true
