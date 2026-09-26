@@ -1385,7 +1385,7 @@ fn file_open_dialog(
     if options.multiple {
         dialog_options |= FOS_ALLOWMULTISELECT;
     }
-    if options.directories {
+    if options.directories && !options.files {
         dialog_options |= FOS_PICKFOLDERS;
     }
 
@@ -1396,13 +1396,23 @@ fn file_open_dialog(
             let prompt: &str = &prompt;
             folder_dialog.SetOkButtonLabel(&HSTRING::from(prompt))?;
         }
-
-        if let Err(error) = folder_dialog.Show(window) {
-            if error.code() == HRESULT::from_win32(ERROR_CANCELLED.0) {
-                return Ok(None);
-            }
-            return Err(error.into());
+    }
+    let mixed = (options.files && options.directories)
+        .then(|| crate::file_dialog::MixedPathDialog::new(&folder_dialog))
+        .transpose()?;
+    let shown = unsafe { folder_dialog.Show(window) };
+    let selected_folder = mixed
+        .map(|mixed| mixed.finish(&folder_dialog))
+        .transpose()?
+        .flatten();
+    if let Err(error) = shown {
+        if error.code() == HRESULT::from_win32(ERROR_CANCELLED.0) {
+            return Ok(None);
         }
+        return Err(error.into());
+    }
+    if let Some(folder) = selected_folder {
+        return Ok(Some(vec![folder]));
     }
 
     let results = unsafe { folder_dialog.GetResults()? };
