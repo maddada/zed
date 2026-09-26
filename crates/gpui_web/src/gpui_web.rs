@@ -1,7 +1,8 @@
-//! GPUI's browser platform uses one document-owned canvas and supports one top-level window.
+//! GPUI's browser platform draws its first window on a document-owned canvas that fills the page.
 //! Browser WebGPU is preferred by default, with an automatic WebGL2 fallback. Applications can
-//! force either backend with `WebBackendPreference`. Opening a second top-level window, or
-//! reopening one after it closes, returns `WebWindowError`.
+//! force either backend with `WebBackendPreference`. Every window opened while that one is open
+//! (menus, pickers, dialogs) is an overlay canvas laid over the page at its bounds, which needs
+//! WebGPU. Reopening the page's window after it closes returns `WebWindowError`.
 
 pub mod canvas_fallback;
 

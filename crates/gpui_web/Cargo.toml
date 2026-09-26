@@ -75,6 +75,8 @@ web-sys = { version = "0.3", features = [
     "MediaQueryListEvent",
     "MouseEvent",
     "Navigator",
+    "Node",
+    "NodeList",
     "OffscreenCanvas",
     "OffscreenCanvasRenderingContext2d",
     "PointerEvent",

@@ -2,7 +2,7 @@ use crate::display::WebDisplay;
 use crate::events::{
     ClickState, EventListenerHandle, TouchIds, WebEventListeners, is_mac_platform,
 };
-use crate::ime_mirror::ImeMirror;
+use crate::ime_mirror::{ImeMirror, focus_topmost_window_input};
 use crate::platform::WebWindowLifecycle;
 use crate::viewport::WebViewport;
 use std::sync::Arc;
@@ -90,11 +90,21 @@ pub(crate) struct WebWindowInner {
     raf_function: RefCell<Option<js_sys::Function>>,
 }
 
+/// Which of the page's windows a [`WebWindow`] is.
+pub(crate) enum WebWindowRole {
+    /// The page's own window: it fills the page, and its lifecycle is the platform's.
+    Page(Rc<Cell<WebWindowLifecycle>>),
+    /// A later window (an app's menus, pickers and dialogs, which are separate windows on the
+    /// desktop platforms): a transparent canvas laid over the page at the bounds it asked for.
+    Overlay,
+}
+
 pub struct WebWindow {
     inner: Rc<WebWindowInner>,
+    handle: AnyWindowHandle,
     display: Rc<dyn PlatformDisplay>,
-    lifecycle: Rc<Cell<WebWindowLifecycle>>,
-    active_window: Rc<RefCell<Option<AnyWindowHandle>>>,
+    role: WebWindowRole,
+    open_windows: Rc<RefCell<Vec<AnyWindowHandle>>>,
     _raf_closure: Closure<dyn FnMut()>,
     _resize_observer: Option<web_sys::ResizeObserver>,
     _resize_observer_closure: Closure<dyn FnMut(js_sys::Array)>,
@@ -141,17 +151,48 @@ impl WebWindow {
         Ok(canvas)
     }
 
+    /// A canvas for an overlay window: fixed over the page at `bounds`, which are in the page
+    /// window's coordinates and so also the page's, and transparent where it draws nothing. Later
+    /// overlays come later in the document and so stack above earlier ones.
+    pub(crate) fn prepare_overlay_canvas(
+        browser_window: &web_sys::Window,
+        bounds: Bounds<Pixels>,
+    ) -> anyhow::Result<web_sys::HtmlCanvasElement> {
+        let canvas = Self::prepare_canvas(browser_window)?;
+        let style = canvas.style();
+        for (property, value) in [
+            ("position", "fixed".to_string()),
+            ("z-index", "1000".to_string()),
+            ("background", "transparent".to_string()),
+            ("left", format!("{}px", f32::from(bounds.origin.x))),
+            ("top", format!("{}px", f32::from(bounds.origin.y))),
+            ("width", format!("{}px", f32::from(bounds.size.width))),
+            ("height", format!("{}px", f32::from(bounds.size.height))),
+        ] {
+            if let Err(error) = style.set_property(property, &value) {
+                let element: &web_sys::Element = canvas.as_ref();
+                element.remove();
+                anyhow::bail!("Failed to set overlay canvas {property} style: {error:?}");
+            }
+        }
+        Ok(canvas)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
-        _handle: AnyWindowHandle,
-        _params: WindowParams,
+        handle: AnyWindowHandle,
+        params: WindowParams,
         context: &WgpuContext,
         canvas: web_sys::HtmlCanvasElement,
         surface: wgpu::Surface<'static>,
         browser_window: web_sys::Window,
-        lifecycle: Rc<Cell<WebWindowLifecycle>>,
-        active_window: Rc<RefCell<Option<AnyWindowHandle>>>,
+        role: WebWindowRole,
+        open_windows: Rc<RefCell<Vec<AnyWindowHandle>>>,
     ) -> anyhow::Result<Self> {
+        let is_overlay = matches!(role, WebWindowRole::Overlay);
+        // An overlay opened with `focus: false` (a non-activating popup) leaves the keyboard with
+        // the window that has it, as on the desktop platforms.
+        let takes_focus = !is_overlay || params.focus;
         let document = browser_window
             .document()
             .ok_or_else(|| anyhow::anyhow!("No `document` found on window"))?;
@@ -166,7 +207,7 @@ impl WebWindow {
                 width: DevicePixels(0),
                 height: DevicePixels(0),
             },
-            transparent: false,
+            transparent: is_overlay,
             preferred_present_mode: None,
         };
         let renderer = WgpuRenderer::new_from_surface(context, surface, renderer_config)?;
@@ -176,15 +217,25 @@ impl WebWindow {
             .ok()
             .flatten()
             .is_some_and(|query| query.matches());
-        let ime_mirror = ImeMirror::new(&document, &body, touch_input)?;
+        // An overlay takes the keyboard once it is open (below), not while the
+        // platform is still opening it.
+        let ime_mirror = ImeMirror::new(&document, &body, touch_input, takes_focus && !is_overlay)?;
         let mut viewport = WebViewport::new(&document)?;
         viewport.update(&browser_window, &canvas)?;
 
         let display: Rc<dyn PlatformDisplay> = Rc::new(WebDisplay::new(browser_window.clone()));
 
-        let initial_bounds = Bounds {
-            origin: Point::default(),
-            size: Size::default(),
+        // An overlay window already has its CSS size, so its first frame lays out at that size.
+        // Starting it at zero (the resize observer reports the size only after the first frame)
+        // made a dialog that fits its window to its content measure itself at zero width and
+        // resize the window to that.
+        let initial_bounds = if is_overlay {
+            params.bounds
+        } else {
+            Bounds {
+                origin: Point::default(),
+                size: Size::default(),
+            }
         };
 
         let mutable_state = WebWindowMutableState {
@@ -195,7 +246,7 @@ impl WebWindow {
             title: String::new(),
             input_handler: None,
             is_fullscreen: false,
-            is_active: true,
+            is_active: takes_focus,
             visibility: document_visibility(&browser_window),
             is_hovered: false,
             mouse_position: Point::default(),
@@ -264,11 +315,32 @@ impl WebWindow {
                 }
             };
 
+        if is_overlay && takes_focus {
+            // Focusing this overlay's element blurs the window under it, whose
+            // blur listener tells GPUI that window went inactive. While the
+            // platform is still opening this window the app is borrowed and
+            // that update would be dropped, so the keyboard moves once the
+            // open has returned and both windows hear about it.
+            let weak = Rc::downgrade(&inner);
+            let focus = Closure::once_into_js(move || {
+                if let Some(inner) = weak.upgrade() {
+                    inner.ime_mirror.focus();
+                }
+            });
+            if let Err(error) = inner
+                .browser_window
+                .set_timeout_with_callback(focus.unchecked_ref())
+            {
+                log::warn!("failed to focus the overlay window's keyboard receiver: {error:?}");
+            }
+        }
+
         Ok(Self {
             inner,
+            handle,
             display,
-            lifecycle,
-            active_window,
+            role,
+            open_windows,
             _raf_closure: raf_closure,
             _resize_observer: resize_observer,
             _resize_observer_closure: resize_observer_closure,
@@ -618,9 +690,20 @@ impl Drop for WebWindow {
 
         let canvas: &web_sys::Element = self.inner.canvas.as_ref();
         canvas.remove();
+        let had_keyboard = self.inner.ime_mirror.is_focused();
         self.inner.ime_mirror.remove();
-        self.active_window.borrow_mut().take();
-        self.lifecycle.set(WebWindowLifecycle::Closed);
+        self.open_windows
+            .borrow_mut()
+            .retain(|handle| *handle != self.handle);
+        match &self.role {
+            WebWindowRole::Page(lifecycle) => lifecycle.set(WebWindowLifecycle::Closed),
+            // A closed overlay leaves the page, and the keyboard goes back to the window under it.
+            WebWindowRole::Overlay => {
+                if had_keyboard && let Some(document) = self.inner.browser_window.document() {
+                    focus_topmost_window_input(&document);
+                }
+            }
+        }
     }
 }
 
