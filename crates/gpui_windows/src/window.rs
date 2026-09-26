@@ -955,6 +955,26 @@ impl PlatformWindow for WindowsWindow {
         }
     }
 
+    // Ghostex: DWM rounds a window to one of two fixed radii (Windows 11 only; Windows 10 keeps
+    // square corners), so the requested radius picks the nearer one.
+    fn set_background_corner_radius(&self, radius: Pixels) {
+        let preference = if radius <= px(0.0) {
+            DWMWCP_DONOTROUND
+        } else if radius < px(6.0) {
+            DWMWCP_ROUNDSMALL
+        } else {
+            DWMWCP_ROUND
+        };
+        let _ = unsafe {
+            DwmSetWindowAttribute(
+                self.0.hwnd,
+                DWMWA_WINDOW_CORNER_PREFERENCE,
+                &preference as *const _ as *const _,
+                std::mem::size_of_val(&preference) as u32,
+            )
+        };
+    }
+
     fn minimize(&self) {
         unsafe { ShowWindowAsync(self.0.hwnd, SW_MINIMIZE).ok().log_err() };
     }
