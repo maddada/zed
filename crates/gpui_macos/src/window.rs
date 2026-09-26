@@ -306,6 +306,10 @@ unsafe fn build_classes() {
                 sel!(updateLayer),
                 blurred_view_update_layer as extern "C" fn(&Object, Sel),
             );
+            decl.add_method(
+                sel!(hitTest:),
+                blurred_view_hit_test as extern "C" fn(&Object, Sel, NSPoint) -> id,
+            );
             decl.register()
         };
         WINDOW_STATE_ARCHIVER_DELEGATE_CLASS = {
@@ -3768,6 +3772,14 @@ fn display_id_for_screen(screen: id) -> Option<CGDirectDisplayID> {
         let screen_number: NSUInteger = msg_send![screen_number, unsignedIntegerValue];
         Some(screen_number as CGDirectDisplayID)
     }
+}
+
+/// Ghostex: the blur is a backdrop the content view hosts, never a target of its own. Hit by a
+/// click it would stand in for the content view, and in a window that is not key AppKit asks the
+/// hit view whether the first click may pass (`acceptsFirstMouse:`); the effect view says no, so
+/// the first click on a non-activating blurred popup (a frosted menu) was swallowed.
+extern "C" fn blurred_view_hit_test(_: &Object, _: Sel, _: NSPoint) -> id {
+    nil
 }
 
 extern "C" fn blurred_view_init_with_frame(this: &Object, _: Sel, frame: NSRect) -> id {
