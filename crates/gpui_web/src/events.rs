@@ -95,6 +95,7 @@ impl WebWindowInner {
             self.register_composition_start(),
             self.register_composition_update(),
             self.register_composition_end(),
+            self.register_before_input(),
             self.register_focus(),
             self.register_blur(),
             self.register_pointer_enter(),
@@ -579,6 +580,36 @@ impl WebWindowInner {
         })
     }
 
+    /// Text inserted without a keydown (dictation, an IME that commits directly, a test driver's
+    /// `Input.insertText`) arrives only as `beforeinput`; a typed character never does, because the
+    /// keydown handler prevents its default.
+    fn register_before_input(self: &Rc<Self>) -> Closure<dyn FnMut(JsValue)> {
+        let this = Rc::clone(self);
+        self.listen_input("beforeinput", move |event: JsValue| {
+            if this.is_composing.get() {
+                return;
+            }
+            let input_type = js_sys::Reflect::get(&event, &"inputType".into())
+                .ok()
+                .and_then(|value| value.as_string())
+                .unwrap_or_default();
+            if input_type != "insertText" && input_type != "insertReplacementText" {
+                return;
+            }
+            let Some(data) = js_sys::Reflect::get(&event, &"data".into())
+                .ok()
+                .and_then(|value| value.as_string())
+                .filter(|data| !data.is_empty())
+            else {
+                return;
+            };
+            event.unchecked_ref::<web_sys::Event>().prevent_default();
+            this.with_input_handler(|handler| {
+                handler.replace_text_in_range(None, &data);
+            });
+        })
+    }
+
     fn register_focus(self: &Rc<Self>) -> Closure<dyn FnMut(JsValue)> {
         let this = Rc::clone(self);
         self.listen_input("focus", move |_event: JsValue| {
@@ -600,7 +631,17 @@ impl WebWindowInner {
 
     fn register_blur(self: &Rc<Self>) -> Closure<dyn FnMut(JsValue)> {
         let this = Rc::clone(self);
-        self.listen_input("blur", move |_event: JsValue| {
+        self.listen_input("blur", move |event: JsValue| {
+            // Focus moving onto this window's accessibility mirror (a driver focusing a mirrored
+            // text field, which replays its keys and text on this input) keeps the window active.
+            let moves_to_mirror = js_sys::Reflect::get(&event, &"relatedTarget".into())
+                .ok()
+                .and_then(|target| target.dyn_into::<web_sys::Element>().ok())
+                .and_then(|target| target.closest("[data-gpui-a11y-root]").ok().flatten())
+                .is_some();
+            if moves_to_mirror {
+                return;
+            }
             {
                 let mut state = this.state.borrow_mut();
                 state.is_active = false;

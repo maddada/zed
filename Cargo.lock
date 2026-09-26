@@ -8014,6 +8014,7 @@ dependencies = [
 name = "gpui_web"
 version = "0.1.0"
 dependencies = [
+ "accesskit",
  "anyhow",
  "console_error_panic_hook",
  "futures 0.3.32",
