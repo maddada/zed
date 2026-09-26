@@ -3284,6 +3284,40 @@ impl Window {
         self.last_input_modality == InputModality::Touch
     }
 
+    /// Shows `build`'s view for `duration` as the tooltip of the tooltip trigger under the pointer,
+    /// in place of that trigger's own tooltip, then gives the trigger its tooltip back. Returns
+    /// false, showing nothing, when no trigger painted in the last frame is under the pointer.
+    /// For feedback on the control just clicked ("Copied!") that should read as its tooltip
+    /// changing rather than as a second label beside it.
+    pub fn flash_hovered_tooltip(
+        &mut self,
+        duration: Duration,
+        build: impl Fn(&mut Window, &mut App) -> AnyView + 'static,
+        cx: &mut App,
+    ) -> bool {
+        let hit_test = self.pointer_hit_test(&self.rendered_frame);
+        if hit_test != self.mouse_hit_test {
+            self.mouse_hit_test = hit_test;
+            self.reset_cursor_style(cx);
+        }
+        let request = crate::TooltipFlashRequest {
+            build: Rc::new(build),
+            duration,
+            claimed: Cell::new(false),
+        };
+        let mut mouse_listeners = mem::take(&mut self.rendered_frame.mouse_listeners);
+        for listener in mouse_listeners.iter_mut().rev() {
+            if let Some(listener) = listener.as_mut() {
+                listener(&request, DispatchPhase::Bubble, self, cx);
+            }
+            if request.claimed.get() {
+                break;
+            }
+        }
+        self.rendered_frame.mouse_listeners = mouse_listeners;
+        request.claimed.get()
+    }
+
     /// The current state of the keyboard's capslock
     pub fn capslock(&self) -> Capslock {
         self.capslock

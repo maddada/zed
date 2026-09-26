@@ -3749,6 +3749,7 @@ pub(crate) fn register_tooltip_mouse_handlers(
     window.on_mouse_event({
         let active_tooltip = active_tooltip.clone();
         let build_tooltip = build_tooltip.clone();
+        let check_is_hovered = check_is_hovered.clone();
         let check_is_hovered_during_prepaint = check_is_hovered_during_prepaint.clone();
         move |event: &LongPressEvent, phase, window, cx| {
             if !phase.bubble() {
@@ -3792,6 +3793,134 @@ pub(crate) fn register_tooltip_mouse_handlers(
             }
         }
     });
+
+    // Not a mouse event: `Window::flash_hovered_tooltip` walks the frame's mouse listeners with
+    // this request, so the flash reaches exactly the triggers painted this frame, cached views
+    // included, and the topmost hovered one claims it.
+    window.next_frame.mouse_listeners.push(Some(Box::new({
+        let active_tooltip = active_tooltip.clone();
+        move |event: &dyn Any, phase: DispatchPhase, window: &mut Window, cx: &mut App| {
+            let Some(request) = event.downcast_ref::<TooltipFlashRequest>() else {
+                return;
+            };
+            if phase.bubble()
+                && !request.claimed.get()
+                && !window.last_input_was_keyboard()
+                && check_is_hovered(window)
+            {
+                request.claimed.set(true);
+                show_tooltip_flash(
+                    &active_tooltip,
+                    request,
+                    &build_tooltip,
+                    &check_is_hovered_during_prepaint,
+                    window,
+                    cx,
+                );
+            }
+        }
+    })));
+}
+
+/// Handed to every tooltip trigger painted in the current frame by
+/// [`Window::flash_hovered_tooltip`].
+pub(crate) struct TooltipFlashRequest {
+    pub(crate) build: Rc<dyn Fn(&mut Window, &mut App) -> AnyView>,
+    pub(crate) duration: Duration,
+    pub(crate) claimed: Cell<bool>,
+}
+
+/// Shows the flash view in place of the trigger's own tooltip at once, then puts the trigger's
+/// tooltip back if the pointer is still on the trigger, or hides it.
+fn show_tooltip_flash(
+    active_tooltip: &Rc<RefCell<Option<ActiveTooltip>>>,
+    request: &TooltipFlashRequest,
+    build_tooltip: &Rc<dyn Fn(&mut Window, &mut App) -> Option<(AnyView, bool)>>,
+    check_is_hovered_during_prepaint: &Rc<dyn Fn(&Window) -> bool>,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let flash_view = (request.build)(window, cx);
+    let flash_view_id = flash_view.entity_id();
+    *active_tooltip.borrow_mut() = Some(visible_tooltip(
+        active_tooltip,
+        flash_view,
+        false,
+        check_is_hovered_during_prepaint,
+        window,
+    ));
+    window.refresh();
+
+    let duration = request.duration;
+    let weak_active_tooltip = Rc::downgrade(active_tooltip);
+    let build_tooltip = build_tooltip.clone();
+    let check_is_hovered_during_prepaint = check_is_hovered_during_prepaint.clone();
+    window
+        .spawn(cx, async move |cx| {
+            cx.background_executor().timer(duration).await;
+            let Some(active_tooltip) = weak_active_tooltip.upgrade() else {
+                return;
+            };
+            cx.update(|window, cx| {
+                // A press, a scroll, or leaving the trigger already replaced or cleared it.
+                let still_flashing = matches!(
+                    active_tooltip.borrow().as_ref(),
+                    Some(ActiveTooltip::Visible { tooltip, .. })
+                        if tooltip.view.entity_id() == flash_view_id
+                );
+                if !still_flashing {
+                    return;
+                }
+                let restored = if check_is_hovered_during_prepaint(window) {
+                    build_tooltip(window, cx).map(|(view, is_hoverable)| {
+                        visible_tooltip(
+                            &active_tooltip,
+                            view,
+                            is_hoverable,
+                            &check_is_hovered_during_prepaint,
+                            window,
+                        )
+                    })
+                } else {
+                    None
+                };
+                *active_tooltip.borrow_mut() = restored;
+                window.refresh();
+            })
+            .ok();
+        })
+        .detach();
+}
+
+fn visible_tooltip(
+    active_tooltip: &Rc<RefCell<Option<ActiveTooltip>>>,
+    view: AnyView,
+    is_hoverable: bool,
+    check_is_hovered_during_prepaint: &Rc<dyn Fn(&Window) -> bool>,
+    window: &Window,
+) -> ActiveTooltip {
+    let weak_active_tooltip = Rc::downgrade(active_tooltip);
+    let check_is_hovered_during_prepaint = check_is_hovered_during_prepaint.clone();
+    ActiveTooltip::Visible {
+        tooltip: AnyTooltip {
+            view,
+            mouse_position: window.mouse_position(),
+            check_visible_and_update: Rc::new(move |tooltip_bounds, window, cx| {
+                let Some(active_tooltip) = weak_active_tooltip.upgrade() else {
+                    return false;
+                };
+                handle_tooltip_check_visible_and_update(
+                    &active_tooltip,
+                    is_hoverable,
+                    &check_is_hovered_during_prepaint,
+                    tooltip_bounds,
+                    window,
+                    cx,
+                )
+            }),
+        },
+        is_hoverable,
+    }
 }
 
 /// Handles displaying tooltips when an element is hovered.
