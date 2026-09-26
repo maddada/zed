@@ -1307,7 +1307,9 @@ fn build_pipeline_state(
     color_attachment.set_source_rgb_blend_factor(metal::MTLBlendFactor::SourceAlpha);
     color_attachment.set_source_alpha_blend_factor(metal::MTLBlendFactor::One);
     color_attachment.set_destination_rgb_blend_factor(metal::MTLBlendFactor::OneMinusSourceAlpha);
-    color_attachment.set_destination_alpha_blend_factor(metal::MTLBlendFactor::One);
+    // CDXC:PlatformSupport 2026-09-19 WHY:
+    // Alpha composites "over" like the colour, as wgpu's `ALPHA_BLENDING` does on Linux. Adding it (`One`) summed the coverage of every primitive sharing an anti-aliased edge, and a div paints its background and its border as two quads with the same edge, so a transparent window's rounded corners came out nearly opaque with only the colour of a half-covered pixel, which macOS composited as a dark dotted rim on light backgrounds. Opaque windows ignore this channel.
+    color_attachment.set_destination_alpha_blend_factor(metal::MTLBlendFactor::OneMinusSourceAlpha);
 
     device
         .new_render_pipeline_state(&descriptor)
@@ -1341,7 +1343,10 @@ fn build_path_sprite_pipeline_state(
     color_attachment.set_source_rgb_blend_factor(metal::MTLBlendFactor::One);
     color_attachment.set_source_alpha_blend_factor(metal::MTLBlendFactor::One);
     color_attachment.set_destination_rgb_blend_factor(metal::MTLBlendFactor::OneMinusSourceAlpha);
-    color_attachment.set_destination_alpha_blend_factor(metal::MTLBlendFactor::One);
+    // Alpha must accumulate as `src.a + dst.a * (1 - src.a)` like the other pipelines. An
+    // additive `One` saturates to opaque wherever a path's antialiased edge lands on an already
+    // translucent pixel, and on a transparent window that punches a dark fringe into the blur.
+    color_attachment.set_destination_alpha_blend_factor(metal::MTLBlendFactor::OneMinusSourceAlpha);
 
     device
         .new_render_pipeline_state(&descriptor)
