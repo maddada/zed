@@ -408,9 +408,7 @@ impl WindowsWindowInner {
     /// The window hover flag only redraws; element hover listeners need MouseExited to clear their delayed highlight.
     fn handle_mouse_leave_msg(&self, handle: HWND) -> Option<isize> {
         self.state.hovered.set(false);
-        // The next window's `WM_SETCURSOR` picks its own cursor, so we just clear
-        // the flag for tight `is_cursor_visible()` semantics.
-        self.state.cursor_visible.store(true, Ordering::Relaxed);
+        self.restore_cursor_after_hide();
         if let Some(mut callback) = self.state.callbacks.hovered_status_change.take() {
             callback(false);
             self.state
@@ -861,7 +859,7 @@ impl WindowsWindowInner {
         let this = self.clone();
 
         if !activated {
-            this.state.cursor_visible.store(true, Ordering::Relaxed);
+            this.restore_cursor_after_hide();
         }
 
         // When the window is activated (gains focus), reset the modifier tracking state.
@@ -1459,7 +1457,8 @@ impl WindowsWindowInner {
         }
     }
 
-    /// Clear the hidden flag and restore the cursor immediately
+    /// CDXC:PlatformSupport 2026-09-29 WHY:
+    /// Mouse exit and deactivation must restore the Win32 cursor together with the shared visible flag; clearing only the flag leaves the next mouse move believing an invisible cursor is already visible.
     fn restore_cursor_after_hide(&self) {
         if !self.state.cursor_visible.swap(true, Ordering::Relaxed) {
             unsafe {
