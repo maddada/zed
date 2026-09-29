@@ -544,17 +544,19 @@ impl X11WindowState {
                     visual.depth,
                     x_window,
                     visual_set.root,
-                    bounds.origin.x.0 + 2,
+                    bounds.origin.x.0,
                     bounds.origin.y.0,
                     bounds.size.width.0,
                     bounds.size.height.0
                 )
             },
+            // CDXC:PlatformSupport 2026-09-29 WHY:
+            // KWin keeps the position a window is created at (with the user-specified position hint below it no longer re-centers it), so the 2px nudge upstream added at creation moved every restored window 2px right on each launch. The nudge stays only in the default-position fallback after the geometry check.
             xcb.create_window(
                 visual.depth,
                 x_window,
                 visual_set.root,
-                (bounds.origin.x.0 + 2) as i16,
+                bounds.origin.x.0 as i16,
                 bounds.origin.y.0 as i16,
                 bounds.size.width.0 as u16,
                 bounds.size.height.0 as u16,
@@ -850,6 +852,13 @@ impl X11WindowState {
                 size_hints.min_size = Some(dimensions);
                 size_hints.max_size = Some(dimensions);
             }
+            // CDXC:PlatformSupport 2026-09-29 WHY:
+            // Without a position in WM_NORMAL_HINTS, KWin applied its own placement (centered) and ignored the origin the window was created at, so a window reopened at its saved frame always came back centered. A user-specified position is the one window managers keep; KWin puts the window's visible frame there, which is the origin `bounds()` reports back.
+            size_hints.position = Some((
+                x11rb::properties::WmSizeHintsSpecification::UserSpecified,
+                bounds.origin.x.0,
+                bounds.origin.y.0,
+            ));
             check_reply(
                 || {
                     format!(
@@ -1425,6 +1434,18 @@ impl X11WindowStatePtr {
             // because it contains wrong values.
             if is_resize {
                 state.bounds.size = bounds.size;
+                // CDXC:PlatformSupport 2026-09-29 WHY:
+                // Keeping the old origin on a resize left `bounds()` at the requested position after the window manager grew a client-decorated window by its `_GTK_FRAME_EXTENTS` and moved it out by the inset, while a later move reported the real one. The two differ by the inset, so a saved and restored window shifted on every launch. The real position is read from the server instead.
+                if let Some(position) = get_reply(
+                    || "X11 TranslateCoordinates after resize failed.",
+                    self.xcb
+                        .translate_coordinates(self.x_window, state.x_root_window, 0, 0),
+                )
+                .log_err()
+                {
+                    state.bounds.origin.x = px(position.dst_x as f32 / state.scale_factor);
+                    state.bounds.origin.y = px(position.dst_y as f32 / state.scale_factor);
+                }
             } else {
                 state.bounds = bounds;
             }
