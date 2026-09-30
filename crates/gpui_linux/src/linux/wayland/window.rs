@@ -1878,6 +1878,9 @@ impl PlatformWindow for WaylandWindow {
     fn set_background_wallpaper_cover(&self, cover: Option<Bounds<Pixels>>) {
         self.borrow_mut().glass.cover = cover;
     }
+    fn set_background_blur_style(&self, radius: Pixels, _keep_saturation: bool) {
+        self.borrow_mut().glass.set_blur_radius(radius);
+    }
     fn set_background_live(&self, live: Option<gpui::LiveBackground>) {
         self.borrow_mut().glass.live = live;
     }

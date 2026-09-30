@@ -2962,9 +2962,10 @@ impl Window {
         self.platform_window.set_background_corner_radius(radius);
     }
 
-    /// Ghostex: tunes a blurred window background for a small floating surface such as a menu or
-    /// tooltip: how wide the blur is, and whether the backdrop keeps its colour saturation, so the
-    /// colours behind the surface show through instead of washing out to grey.
+    /// Ghostex: tunes a blurred window background: how wide the blur is in points (0: none), and
+    /// whether the backdrop keeps its colour saturation, so the colours behind a menu or tooltip
+    /// show through instead of washing out to grey. See `PlatformWindow::set_background_blur_style`
+    /// for which backdrops each platform can blur.
     pub fn set_background_blur_style(&self, radius: Pixels, keep_saturation: bool) {
         self.platform_window
             .set_background_blur_style(radius, keep_saturation);

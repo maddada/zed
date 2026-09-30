@@ -1023,6 +1023,15 @@ impl PlatformWindow for WindowsWindow {
         self.update_backdrop(|request| request.live = live);
     }
 
+    // Ghostex: the radius the backdrop blurs its pictures by. DWM's own behind-window blur has no
+    // radius to set, and the backdrop keeps the picture's saturation either way.
+    fn set_background_blur_style(&self, radius: Pixels, _keep_saturation: bool) {
+        let radius = f32::from(radius);
+        self.update_backdrop(|request| {
+            request.blur_radius = radius.is_finite().then_some(radius.max(0.0))
+        });
+    }
+
     // Ghostex: a frosted surface keeps its blur, and everything it draws, inside the rounded rects
     // it reports each frame (a tooltip host is exactly its bubble, a toast stack its cards). Windows
     // can only confine a window's blur by clipping the window, so the window's region is set to

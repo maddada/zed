@@ -19,7 +19,7 @@ pub(super) struct Video {
 }
 
 impl Video {
-    pub fn open(path: &std::path::Path, cover_width: f32) -> Option<Self> {
+    pub fn open(path: &std::path::Path, cover_width: f32, blur_radius: f32) -> Option<Self> {
         let path_text = path.to_str()?;
         let metadata = system::command(
             "ffprobe",
@@ -55,9 +55,14 @@ impl Video {
         let scale = 512.0 / width.max(height);
         let width = (width * scale).round().max(1.0) as u32;
         let height = (height * scale).round().max(1.0) as u32;
-        let sigma = (60.0 * width as f32 / cover_width.max(1.0)).clamp(0.1, 64.0);
-        let filter =
-            format!("fps=24,scale={width}:{height},gblur=sigma={sigma}:steps=3,format=rgba");
+        let sigma = (blur_radius * width as f32 / cover_width.max(1.0)).min(64.0);
+        // A radius of 0 plays the frames sharp.
+        let blur = if sigma > 0.0 {
+            format!("gblur=sigma={sigma}:steps=3,")
+        } else {
+            String::new()
+        };
+        let filter = format!("fps=24,scale={width}:{height},{blur}format=rgba");
         let mut child = Command::new("ffmpeg")
             .args([
                 "-nostdin",

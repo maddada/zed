@@ -1890,6 +1890,9 @@ impl PlatformWindow for X11Window {
     fn set_background_wallpaper_cover(&self, cover: Option<Bounds<Pixels>>) {
         self.0.state.borrow_mut().glass.cover = cover;
     }
+    fn set_background_blur_style(&self, radius: Pixels, _keep_saturation: bool) {
+        self.0.state.borrow_mut().glass.set_blur_radius(radius);
+    }
     fn set_background_live(&self, live: Option<gpui::LiveBackground>) {
         self.0.state.borrow_mut().glass.live = live;
     }

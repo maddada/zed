@@ -35,12 +35,17 @@ unsafe extern "C" {
     static kCIImageApplyOrientationProperty: id;
 }
 
-/// The picture is blurred at this fraction of the screen's size in points. Under a 60pt blur no
-/// detail finer than a few points survives, so the small image is indistinguishable once scaled up.
-const CANVAS_SCALE: f64 = 0.25;
-
-/// Matches the live backdrop's blur (`BLURRED_VIEW_BLUR_RADIUS` in window.rs), in points.
-const WALLPAPER_BLUR_RADIUS: f64 = 60.0;
+/// The picture is blurred on a canvas this fraction of the screen's size in points, for a blur of
+/// `radius` points. Under a 60pt blur no detail finer than a few points survives, so a quarter-size
+/// image is indistinguishable once scaled up; a lighter blur keeps more detail and needs more of
+/// the screen's size, up to all of it for an unblurred picture.
+fn canvas_scale(radius: f64) -> f64 {
+    if radius <= 0.0 {
+        1.0
+    } else {
+        (15.0 / radius).clamp(0.25, 1.0)
+    }
+}
 
 /// Pictures blurred so far, by wallpaper file, placement options and screen size. A handful covers
 /// every display and Space; the oldest is dropped past that.
@@ -67,7 +72,12 @@ pub(crate) struct Wallpaper {
 /// `desktopImageURLForScreen:` reports the system's default picture rather than what is on screen,
 /// so that placeholder is replaced by a still of the built-in wallpaper
 /// (`window_wallpaper_system`), and a wallpaper with no still keeps the live blur.
-pub(crate) unsafe fn wallpaper_for_window(window: id, image: Option<&Path>) -> Option<Wallpaper> {
+/// `blur_radius` is the window's backdrop blur in points (`set_background_blur_style`).
+pub(crate) unsafe fn wallpaper_for_window(
+    window: id,
+    image: Option<&Path>,
+    blur_radius: f64,
+) -> Option<Wallpaper> {
     unsafe {
         let screen: id = msg_send![window, screen];
         if screen == nil {
@@ -92,13 +102,14 @@ pub(crate) unsafe fn wallpaper_for_window(window: id, image: Option<&Path>) -> O
             }
             None => desktop_picture(screen, &size)?,
         };
+        let key = format!("{key}|blur{blur_radius}");
         if let Some(image) = cached(&key) {
             return Some(Wallpaper {
                 image,
                 screen_frame,
             });
         }
-        let image = render_blurred(url, &placement, screen_frame.size)?;
+        let image = render_blurred(url, &placement, screen_frame.size, blur_radius)?;
         store(key, image);
         Some(Wallpaper {
             image,
@@ -350,16 +361,16 @@ impl Placement {
     }
 
     /// Horizontal and vertical scale of an `image` sized picture on a `canvas`.
-    fn scale(&self, image: NSSize, canvas: NSSize) -> (f64, f64) {
+    fn scale(&self, image: NSSize, canvas: NSSize, canvas_scale: f64) -> (f64, f64) {
         let fit_x = canvas.width / image.width;
         let fit_y = canvas.height / image.height;
         match self.scaling {
             0 => {
-                let scale = fit_x.min(fit_y).min(CANVAS_SCALE);
+                let scale = fit_x.min(fit_y).min(canvas_scale);
                 (scale, scale)
             }
             1 => (fit_x, fit_y),
-            2 => (CANVAS_SCALE, CANVAS_SCALE),
+            2 => (canvas_scale, canvas_scale),
             _ => {
                 let scale = if self.allow_clipping {
                     fit_x.max(fit_y)
@@ -385,16 +396,26 @@ struct AffineTransform {
 
 /// The desktop picture laid out on a small screen-shaped canvas the way the desktop places it,
 /// then blurred like the live backdrop.
-unsafe fn render_blurred(url: id, placement: &Placement, screen: NSSize) -> Option<id> {
+unsafe fn render_blurred(
+    url: id,
+    placement: &Placement,
+    screen: NSSize,
+    blur_radius: f64,
+) -> Option<id> {
     unsafe {
         let pool = NSAutoreleasePool::new(nil);
-        let result = render_blurred_in_pool(url, placement, screen);
+        let result = render_blurred_in_pool(url, placement, screen, blur_radius);
         pool.drain();
         result
     }
 }
 
-unsafe fn render_blurred_in_pool(url: id, placement: &Placement, screen: NSSize) -> Option<id> {
+unsafe fn render_blurred_in_pool(
+    url: id,
+    placement: &Placement,
+    screen: NSSize,
+    blur_radius: f64,
+) -> Option<id> {
     unsafe {
         let yes: id = msg_send![class!(NSNumber), numberWithBool: YES];
         let options: id = msg_send![
@@ -413,11 +434,12 @@ unsafe fn render_blurred_in_pool(url: id, placement: &Placement, screen: NSSize)
         {
             return None;
         }
+        let canvas_scale = canvas_scale(blur_radius);
         let canvas = NSSize::new(
-            (screen.width * CANVAS_SCALE).round().max(1.0),
-            (screen.height * CANVAS_SCALE).round().max(1.0),
+            (screen.width * canvas_scale).round().max(1.0),
+            (screen.height * canvas_scale).round().max(1.0),
         );
-        let (scale_x, scale_y) = placement.scale(extent.size, canvas);
+        let (scale_x, scale_y) = placement.scale(extent.size, canvas, canvas_scale);
         let transform = AffineTransform {
             a: scale_x,
             b: 0.0,
@@ -441,18 +463,22 @@ unsafe fn render_blurred_in_pool(url: id, placement: &Placement, screen: NSSize)
         // Clamped so the blur pulls in the picture's own edge colours rather than darkening the
         // screen's edges.
         let clamped: id = msg_send![cropped, imageByClampingToExtent];
-        let radius: id =
-            msg_send![class!(NSNumber), numberWithDouble: WALLPAPER_BLUR_RADIUS * CANVAS_SCALE];
-        let parameters: id = msg_send![
-            class!(NSDictionary),
-            dictionaryWithObject: radius
-            forKey: ns_string("inputRadius")
-        ];
-        let blurred: id = msg_send![
-            clamped,
-            imageByApplyingFilter: ns_string("CIGaussianBlur")
-            withInputParameters: parameters
-        ];
+        let blurred: id = if blur_radius > 0.0 {
+            let radius: id =
+                msg_send![class!(NSNumber), numberWithDouble: blur_radius * canvas_scale];
+            let parameters: id = msg_send![
+                class!(NSDictionary),
+                dictionaryWithObject: radius
+                forKey: ns_string("inputRadius")
+            ];
+            msg_send![
+                clamped,
+                imageByApplyingFilter: ns_string("CIGaussianBlur")
+                withInputParameters: parameters
+            ]
+        } else {
+            clamped
+        };
         if blurred == nil {
             return None;
         }

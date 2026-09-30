@@ -14,6 +14,10 @@ use std::{
 mod system;
 mod video;
 
+/// The blur, in points, of the pictures and videos a window's glass shows when the app never set
+/// one (`set_background_blur_style`); matches the macOS backdrop's.
+pub(crate) const DEFAULT_BLUR_RADIUS: f32 = 60.0;
+
 #[derive(Default)]
 pub(crate) struct Glass {
     pub enabled: bool,
@@ -23,6 +27,8 @@ pub(crate) struct Glass {
     pub only_on_power: bool,
     pub follows_screen: bool,
     pub cover: Option<Bounds<Pixels>>,
+    /// The blur radius in points; `None` is `DEFAULT_BLUR_RADIUS` and 0 shows the picture sharp.
+    blur_radius: Option<f32>,
     pub title: String,
     pub wake: Option<calloop::ping::Ping>,
     worker: Option<Worker>,
@@ -76,6 +82,7 @@ impl Glass {
             Selection::Image(self.image.clone())
         };
         let wake = self.wake.clone();
+        let blur_radius = self.blur_radius();
         let worker = self.worker.get_or_insert_with(|| Worker::new(wake));
         let request = Request {
             selection: selection.clone(),
@@ -96,6 +103,7 @@ impl Glass {
                     .width,
             )
             .max(1.0),
+            blur_radius,
         };
         worker.request(request);
         let output = worker.output.lock().unwrap().clone();
@@ -174,6 +182,20 @@ impl Glass {
         })
     }
 
+    /// Sets the blur of the pictures and videos this window's glass shows; a change re-blurs them.
+    pub fn set_blur_radius(&mut self, radius: Pixels) {
+        let radius = f32::from(radius);
+        self.blur_radius = Some(if radius.is_finite() {
+            radius.max(0.0)
+        } else {
+            DEFAULT_BLUR_RADIUS
+        });
+    }
+
+    fn blur_radius(&self) -> f32 {
+        self.blur_radius.unwrap_or(DEFAULT_BLUR_RADIUS)
+    }
+
     pub fn needs_frame(&self) -> bool {
         self.enabled
             && (self.dirty
@@ -202,6 +224,7 @@ struct Request {
     light: bool,
     follows_screen: bool,
     cover_width: f32,
+    blur_radius: f32,
 }
 
 #[derive(Clone, Default)]
@@ -268,6 +291,7 @@ fn run(
     let mut applied = None;
     let mut image_key = None;
     let mut player: Option<video::Video> = None;
+    let mut video_key = None;
     loop {
         let before = output.lock().unwrap().clone();
         let changed = applied.as_ref() != Some(&request.selection);
@@ -291,19 +315,22 @@ fn run(
                         path.clone(),
                         std::fs::metadata(path).and_then(|m| m.modified()).ok(),
                         request.cover_width.to_bits(),
+                        request.blur_radius.to_bits(),
                     )
                 });
                 if changed || key != image_key {
-                    let image = path
-                        .as_ref()
-                        .and_then(|path| load_image(path, request.cover_width));
+                    let image = path.as_ref().and_then(|path| {
+                        load_image(path, request.cover_width, request.blur_radius)
+                    });
                     output.lock().unwrap().image = image.map(Arc::new);
                     image_key = key;
                 }
             }
             Selection::Video(path) => {
-                if changed || (!before.reduce_motion && system.reduce_motion) {
-                    player = video::Video::open(path, request.cover_width);
+                let key = Some(request.blur_radius.to_bits());
+                if changed || key != video_key || (!before.reduce_motion && system.reduce_motion) {
+                    video_key = key;
+                    player = video::Video::open(path, request.cover_width, request.blur_radius);
                     if player.is_none() {
                         log::warn!(
                             "Cannot open glass video; FFmpeg and ffprobe must be installed and the file must be readable"
@@ -370,7 +397,7 @@ fn run(
     }
 }
 
-fn load_image(path: &PathBuf, cover_width: f32) -> Option<GlassImage> {
+fn load_image(path: &PathBuf, cover_width: f32, blur_radius: f32) -> Option<GlassImage> {
     let reader = image::ImageReader::open(path)
         .ok()?
         .with_guessed_format()
@@ -396,8 +423,13 @@ fn load_image(path: &PathBuf, cover_width: f32) -> Option<GlassImage> {
         }
         pixel[3] = 255;
     }
-    let sigma = 60.0 * image.width() as f32 / cover_width;
-    let blurred = image::imageops::blur(&image, sigma.max(0.1));
+    let sigma = blur_radius * image.width() as f32 / cover_width;
+    // A radius of 0 shows the picture sharp; the blur itself rejects a zero sigma.
+    let blurred = if sigma > 0.0 {
+        image::imageops::blur(&image, sigma)
+    } else {
+        image
+    };
     Some(GlassImage {
         width: blurred.width(),
         height: blurred.height(),

@@ -74,10 +74,12 @@ const LIVE_DOWNSCALE: f32 = 8.0;
 const LIVE_MAX_TARGET: (f32, f32) = (320.0, 200.0);
 
 /// A blurred picture shows no detail finer than a few points, so it is drawn at a quarter of the
-/// window's logical size and scaled up, like gpui_macos's `CANVAS_SCALE`.
+/// window's logical size and scaled up, like gpui_macos's `CANVAS_SCALE`. A lighter blur keeps
+/// finer detail and is drawn larger (`picture_scale`), up to full size for a sharp picture.
 const PICTURE_SCALE: f32 = 0.25;
 
-/// Matches the macOS wallpaper blur (`WALLPAPER_BLUR_RADIUS`), in points.
+/// The pictures' blur radius, in points, for a window that never set one with
+/// `set_background_blur_style`.
 const PICTURE_BLUR_RADIUS: f32 = 60.0;
 
 const FRAME_INTERVAL_MS: u32 = 1000 / 24;
@@ -120,6 +122,21 @@ pub(crate) struct BackdropRequest {
     pub(crate) follows_screen: bool,
     pub(crate) cover: Option<Bounds<Pixels>>,
     pub(crate) live: Option<LiveBackground>,
+    /// The pictures' blur radius in points from `set_background_blur_style`; `None` keeps
+    /// `PICTURE_BLUR_RADIUS`.
+    pub(crate) blur_radius: Option<f32>,
+}
+
+impl BackdropRequest {
+    fn picture_blur_radius(&self) -> f32 {
+        self.blur_radius.unwrap_or(PICTURE_BLUR_RADIUS)
+    }
+}
+
+/// How much of the window's logical size a picture blurred by `radius` points is drawn at: detail
+/// finer than about a quarter of the radius does not survive the blur.
+fn picture_scale(radius: f32) -> f32 {
+    (4.0 / radius.max(0.0)).clamp(PICTURE_SCALE, 1.0)
 }
 
 /// Where the window sits, in device pixels, for laying a picture out against its monitor.
@@ -165,6 +182,8 @@ struct PictureSource {
     layout: PictureLayout,
     background: [u8; 3],
     canvas: (u32, u32),
+    /// Blur radius in canvas pixels; 0 leaves the picture sharp.
+    blur: usize,
     key: String,
 }
 
@@ -299,7 +318,11 @@ impl Backdrop {
         let Some(placement) = self.placement else {
             return;
         };
-        let Some(source) = picture_source(request.image.as_deref(), &placement) else {
+        let Some(source) = picture_source(
+            request.image.as_deref(),
+            &placement,
+            request.picture_blur_radius(),
+        ) else {
             // A picture that cannot be read leaves the system's live blur, as on macOS.
             self.loading = None;
             self.set_content(None);
@@ -462,10 +485,13 @@ impl Backdrop {
                     (logical_height * factor).round().max(16.0) as u32,
                 )
             }
-            _ => (
-                (logical_width * PICTURE_SCALE).round().max(16.0) as u32,
-                (logical_height * PICTURE_SCALE).round().max(16.0) as u32,
-            ),
+            _ => {
+                let scale = picture_scale(self.request.picture_blur_radius());
+                (
+                    (logical_width * scale).round().max(16.0) as u32,
+                    (logical_height * scale).round().max(16.0) as u32,
+                )
+            }
         };
         gpu.fit(composition, size, placement.client_size)?;
         let fade = fade_amount(self.fade_started);
@@ -1002,18 +1028,29 @@ fn cached_picture(key: &str) -> Option<Arc<BlurredPicture>> {
     })
 }
 
-/// The file the backdrop blurs and how it sits on the monitor: the app's picture filling the
-/// monitor, or the monitor's desktop wallpaper laid out the way Windows places it.
-fn picture_source(image: Option<&Path>, placement: &BackdropPlacement) -> Option<PictureSource> {
+/// The file the backdrop blurs by `radius` points and how it sits on the monitor: the app's
+/// picture filling the monitor, or the monitor's desktop wallpaper laid out the way Windows places
+/// it.
+fn picture_source(
+    image: Option<&Path>,
+    placement: &BackdropPlacement,
+    radius: f32,
+) -> Option<PictureSource> {
     let (monitor_width, monitor_height) = placement.monitor_size();
+    let scale = picture_scale(radius);
     let canvas = (
-        ((monitor_width / placement.scale) * PICTURE_SCALE)
+        ((monitor_width / placement.scale) * scale)
             .round()
             .max(16.0) as u32,
-        ((monitor_height / placement.scale) * PICTURE_SCALE)
+        ((monitor_height / placement.scale) * scale)
             .round()
             .max(16.0) as u32,
     );
+    let blur = if radius > 0.0 {
+        (radius * scale).round().max(1.0) as usize
+    } else {
+        0
+    };
     let (path, layout, background) = match image {
         Some(image) => (image.to_path_buf(), PictureLayout::Cover, [0, 0, 0]),
         None => desktop_wallpaper(placement.monitor)?,
@@ -1025,7 +1062,7 @@ fn picture_source(image: Option<&Path>, placement: &BackdropPlacement) -> Option
         .map(|duration| duration.as_secs())
         .unwrap_or_default();
     let key = format!(
-        "{}|{modified}|{layout:?}|{background:?}|{}x{}",
+        "{}|{modified}|{layout:?}|{background:?}|{}x{}|{blur}",
         path.display(),
         canvas.0,
         canvas.1
@@ -1035,6 +1072,7 @@ fn picture_source(image: Option<&Path>, placement: &BackdropPlacement) -> Option
         layout,
         background,
         canvas,
+        blur,
         key,
     })
 }
@@ -1084,7 +1122,7 @@ fn desktop_wallpaper(monitor: (i32, i32, i32, i32)) -> Option<(PathBuf, PictureL
 }
 
 /// Decodes the picture, lays it out on a small canvas the size of the monitor and blurs it the
-/// way the macOS backdrop does.
+/// way the macOS backdrop does (not at all for a radius of 0).
 fn blur_picture(source: &PictureSource) -> Result<BlurredPicture> {
     let image = image::ImageReader::open(&source.path)
         .with_context(|| format!("opening {}", source.path.display()))?
@@ -1122,15 +1160,16 @@ fn blur_picture(source: &PictureSource) -> Result<BlurredPicture> {
     let offset_x = (canvas_width as i64 - placed.width() as i64) / 2;
     let offset_y = (canvas_height as i64 - placed.height() as i64) / 2;
     image::imageops::overlay(&mut canvas, &placed, offset_x, offset_y);
-    let radius = (PICTURE_BLUR_RADIUS * PICTURE_SCALE).round().max(1.0) as usize;
     let mut rgba = canvas.into_raw();
-    for _ in 0..3 {
-        box_blur(
-            &mut rgba,
-            canvas_width as usize,
-            canvas_height as usize,
-            radius / 2 + 1,
-        );
+    if source.blur > 0 {
+        for _ in 0..3 {
+            box_blur(
+                &mut rgba,
+                canvas_width as usize,
+                canvas_height as usize,
+                source.blur / 2 + 1,
+            );
+        }
     }
     for pixel in rgba.chunks_exact_mut(4) {
         pixel[3] = 255;

@@ -83,12 +83,12 @@ struct CMTime {
     epoch: i64,
 }
 
-/// Matches the live backdrop's blur (`BLURRED_VIEW_BLUR_RADIUS` in window.rs), in points.
-const VIDEO_BLUR_RADIUS: f64 = 60.0;
-
-/// The video layer reaches this far past every edge of the area it covers, so the blur's
-/// transparent fringe falls outside the window instead of darkening its edges.
-const VIDEO_BLEED: f64 = VIDEO_BLUR_RADIUS * 2.0;
+/// How far the video layer reaches past every edge of the area it covers under a blur of `radius`
+/// points, so the blur's transparent fringe falls outside the window instead of darkening its
+/// edges.
+fn video_bleed(radius: f64) -> f64 {
+    radius.max(0.0) * 2.0
+}
 
 static VIEW_CLASS: OnceLock<usize> = OnceLock::new();
 
@@ -104,9 +104,14 @@ static SCREENS_ASLEEP: AtomicBool = AtomicBool::new(false);
 
 static POWER_SOURCE_OBSERVED: OnceLock<()> = OnceLock::new();
 
-/// Adds a video backdrop playing `path` below everything in `content_view`, or `None` when the
-/// file does not exist.
-pub(crate) unsafe fn create_view(content_view: id, path: &Path, only_on_power: bool) -> Option<id> {
+/// Adds a video backdrop playing `path` below everything in `content_view`, blurred by
+/// `blur_radius` points, or `None` when the file does not exist.
+pub(crate) unsafe fn create_view(
+    content_view: id,
+    path: &Path,
+    only_on_power: bool,
+    blur_radius: f64,
+) -> Option<id> {
     unsafe {
         let path_string = path.to_str()?.to_string();
         if !path.is_file() {
@@ -131,15 +136,11 @@ pub(crate) unsafe fn create_view(content_view: id, path: &Path, only_on_power: b
         let _: () = msg_send![video_layer, setVideoGravity: AVLayerVideoGravityResizeAspectFill];
         // `window_wallpaper::layout` places the sublayer with this name.
         let _: () = msg_send![video_layer, setName: ns_string("wallpaper")];
-        let blur: id = msg_send![class!(CIFilter), filterWithName: ns_string("CIGaussianBlur")];
-        let _: () = msg_send![blur, setDefaults];
-        let radius: id = msg_send![class!(NSNumber), numberWithDouble: VIDEO_BLUR_RADIUS];
-        let _: () = msg_send![blur, setValue: radius forKey: ns_string("inputRadius")];
-        let filters: id = msg_send![class!(NSArray), arrayWithObject: blur];
-        let _: () = msg_send![video_layer, setFilters: filters];
+        apply_blur(video_layer, blur_radius);
         let _: () = msg_send![layer, addSublayer: video_layer];
 
         let object = &mut *(view as *mut Object);
+        object.set_ivar::<f64>("gpuiBlurRadius", blur_radius);
         object.set_ivar::<id>("gpuiPlayer", player);
         object.set_ivar::<BOOL>("gpuiOnlyOnPower", if only_on_power { YES } else { NO });
         object.set_ivar::<BOOL>("gpuiWantsPlay", NO);
@@ -219,6 +220,40 @@ pub(crate) unsafe fn set_only_on_power(view: id, only_on_power: bool) {
     }
 }
 
+/// Sets the video layer's blur filter: `radius` points, or none at 0.
+unsafe fn apply_blur(video_layer: id, radius: f64) {
+    unsafe {
+        let filters: id = if radius > 0.0 {
+            let blur: id = msg_send![class!(CIFilter), filterWithName: ns_string("CIGaussianBlur")];
+            let _: () = msg_send![blur, setDefaults];
+            let radius: id = msg_send![class!(NSNumber), numberWithDouble: radius];
+            let _: () = msg_send![blur, setValue: radius forKey: ns_string("inputRadius")];
+            msg_send![class!(NSArray), arrayWithObject: blur]
+        } else {
+            nil
+        };
+        let _: () = msg_send![video_layer, setFilters: filters];
+    }
+}
+
+/// Changes the blur of a video backdrop. The caller lays it out again, since the bleed follows the
+/// radius.
+pub(crate) unsafe fn set_blur_radius(view: id, radius: f64) {
+    unsafe {
+        let object = &mut *(view as *mut Object);
+        object.set_ivar::<f64>("gpuiBlurRadius", radius);
+        let layer: id = msg_send![view, layer];
+        let sublayers: id = msg_send![layer, sublayers];
+        if sublayers == nil {
+            return;
+        }
+        let video_layer: id = msg_send![sublayers, firstObject];
+        if video_layer != nil {
+            apply_blur(video_layer, radius);
+        }
+    }
+}
+
 /// Places the video like the wallpaper picture, then lets it reach past every edge by the blur's
 /// bleed so the edges stay as bright as the middle.
 pub(crate) unsafe fn layout(
@@ -240,14 +275,13 @@ pub(crate) unsafe fn layout(
             return;
         }
         let frame: NSRect = msg_send![video_layer, frame];
+        let object = &*(view as *const Object);
+        let bleed = video_bleed(*object.get_ivar::<f64>("gpuiBlurRadius"));
         let bled = NSRect::new(
-            cocoa::foundation::NSPoint::new(
-                frame.origin.x - VIDEO_BLEED,
-                frame.origin.y - VIDEO_BLEED,
-            ),
+            cocoa::foundation::NSPoint::new(frame.origin.x - bleed, frame.origin.y - bleed),
             cocoa::foundation::NSSize::new(
-                frame.size.width + VIDEO_BLEED * 2.0,
-                frame.size.height + VIDEO_BLEED * 2.0,
+                frame.size.width + bleed * 2.0,
+                frame.size.height + bleed * 2.0,
             ),
         );
         let _: () = msg_send![class!(CATransaction), begin];
@@ -412,6 +446,7 @@ fn view_class() -> *const Class {
         decl.add_ivar::<id>("gpuiPath");
         decl.add_ivar::<BOOL>("gpuiOnlyOnPower");
         decl.add_ivar::<BOOL>("gpuiWantsPlay");
+        decl.add_ivar::<f64>("gpuiBlurRadius");
         unsafe {
             decl.add_method(
                 sel!(videoConditionsDidChange:),

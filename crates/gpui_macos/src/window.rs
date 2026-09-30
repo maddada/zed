@@ -700,8 +700,9 @@ struct MacWindowState {
     /// The drawing live style, shown instead of `video_view` and `wallpaper_view` when one is set.
     live_view: Option<id>,
     background_corner_radius: f64,
-    /// The blur radius (0 = `BLURRED_VIEW_BLUR_RADIUS`) and whether the backdrop keeps its
-    /// saturation (`set_background_blur_style`).
+    /// The blur radius in points of the live blur, the picture and the video (0: none;
+    /// `BLURRED_VIEW_BLUR_RADIUS` until set) and whether the live blur keeps its saturation
+    /// (`set_background_blur_style`).
     background_blur_style: (f64, bool),
     /// The content size GPUI keeps laying out at while an embedder animates the window's frame
     /// (`ghostexSetContentSizeHeld:`). The drawable keeps this size and is shown pinned to the
@@ -1161,7 +1162,7 @@ impl MacWindow {
                 background_live: None,
                 live_view: None,
                 background_corner_radius: 0.0,
-                background_blur_style: (0.0, false),
+                background_blur_style: (BLURRED_VIEW_BLUR_RADIUS, false),
                 held_content_size: None,
                 held_content_pinned_left: false,
                 background_blur_region: Vec::new(),
@@ -1954,9 +1955,21 @@ impl PlatformWindow for MacWindow {
 
     fn set_background_blur_style(&self, radius: Pixels, keep_saturation: bool) {
         let mut this = self.0.as_ref().lock();
-        this.background_blur_style = (f64::from(f32::from(radius)), keep_saturation);
+        let style = (f64::from(f32::from(radius)).max(0.0), keep_saturation);
+        if this.background_blur_style == style {
+            return;
+        }
+        this.background_blur_style = style;
         if let Some(blur_view) = this.blurred_view {
-            unsafe { apply_background_blur_style(blur_view, this.background_blur_style) };
+            unsafe { apply_background_blur_style(blur_view, style) };
+        }
+        if let Some(video_view) = this.video_view {
+            unsafe { window_video::set_blur_radius(video_view, style.0) };
+            layout_window_wallpaper(&this);
+        }
+        if this.wallpaper_view.is_some() {
+            // The picture is blurred once per radius; show the one for the new radius.
+            unsafe { apply_window_backdrop(&mut this) };
         }
     }
 
@@ -3250,6 +3263,7 @@ unsafe fn apply_window_backdrop(this: &mut MacWindowState) {
             window_wallpaper::wallpaper_for_window(
                 this.native_window,
                 this.background_wallpaper_image.as_deref(),
+                this.background_blur_style.0,
             )
         } else {
             None
@@ -3323,7 +3337,12 @@ unsafe fn apply_video_backdrop(this: &mut MacWindowState, content_view: id) -> b
                 retire_backdrop_view(view, window_video::remove_view);
             }
             let Some(view) =
-                window_video::create_view(content_view, &path, this.background_video_only_on_power)
+                window_video::create_view(
+                    content_view,
+                    &path,
+                    this.background_video_only_on_power,
+                    this.background_blur_style.0,
+                )
             else {
                 return false;
             };
@@ -4329,15 +4348,7 @@ extern "C" fn blurred_view_update_layer(this: &Object, _: Sel) {
         if !layer.is_null() {
             let radius: f64 = *this.get_ivar(BLURRED_VIEW_RADIUS_IVAR);
             let keep_saturation: BOOL = *this.get_ivar(BLURRED_VIEW_KEEP_SATURATION_IVAR);
-            remove_layer_background(
-                layer,
-                if radius > 0.0 {
-                    radius
-                } else {
-                    BLURRED_VIEW_BLUR_RADIUS
-                },
-                keep_saturation == YES,
-            );
+            remove_layer_background(layer, radius, keep_saturation == YES);
             // Window snapshots (Mission Control, the app switcher's previews) drop backdrop
             // layers, so with every background stripped the window would show there as nothing
             // at all. The live blur covers this base everywhere else.
@@ -4371,7 +4382,7 @@ unsafe fn apply_background_corner_radius(blur_view: id, radius: f64) {
 /// Holds the `CAShapeLayer` that masks a `BlurredView` to its blur region, or nil.
 const BLURRED_VIEW_REGION_MASK_IVAR: &str = "ghostexRegionMask";
 
-/// A `BlurredView`'s own blur radius (0 = `BLURRED_VIEW_BLUR_RADIUS`).
+/// A `BlurredView`'s own blur radius in points (0: none).
 const BLURRED_VIEW_RADIUS_IVAR: &str = "ghostexBlurRadius";
 
 /// Whether a `BlurredView` keeps the material's saturation filter.
@@ -4463,8 +4474,9 @@ unsafe extern "C" {
     fn CGPathRelease(path: *mut c_void);
 }
 
-/// The material's own blur is tuned for thin sidebars. Under a tinted app surface a wider blur
-/// keeps desktop detail from reading through as noise.
+/// The blur of a window that never calls `set_background_blur_style`. The material's own blur is
+/// tuned for thin sidebars; under a tinted app surface a wider blur keeps desktop detail from
+/// reading through as noise.
 const BLURRED_VIEW_BLUR_RADIUS: f64 = 60.0;
 
 unsafe fn remove_layer_background(layer: id, blur_radius: f64, keep_saturation: bool) {

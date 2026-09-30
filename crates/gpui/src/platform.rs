@@ -940,9 +940,10 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn set_background_appearance(&self, background_appearance: WindowBackgroundAppearance);
     /// Rounds the blurred background's corners, for windows whose content is a rounded card.
     fn set_background_corner_radius(&self, _radius: Pixels) {}
-    /// Ghostex: tunes a blurred background for a small floating surface (a menu or tooltip): the
-    /// blur radius, and whether the backdrop keeps the colour saturation the platform material adds
-    /// (the main window's glass strips it).
+    /// Ghostex: tunes a blurred background: the blur radius in points (0: no blur; 60 until set)
+    /// of whatever the backend blurs itself (the live blur on macOS, and the desktop picture,
+    /// custom image and video on every platform), and whether the live blur keeps the colour
+    /// saturation the platform material adds (the main window's glass strips it).
     fn set_background_blur_style(&self, _radius: Pixels, _keep_saturation: bool) {}
     /// Limits a blurred background to these rounded rectangles, in window coordinates, for a
     /// window whose content is several separate cards; an empty list blurs the whole window.
