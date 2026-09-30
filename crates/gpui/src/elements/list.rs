@@ -73,6 +73,8 @@ struct StateInner {
     measuring_behavior: ListMeasuringBehavior,
     pending_scroll: Option<PendingScroll>,
     follow_state: FollowState,
+    /// The items the last layout measured; see [`ListState::last_measured_range`].
+    last_measured_range: Range<usize>,
 }
 
 /// Deferred scroll adjustment applied after the scroll-top item has been remeasured.
@@ -325,6 +327,7 @@ impl ListState {
             measuring_behavior: ListMeasuringBehavior::default(),
             pending_scroll: None,
             follow_state: FollowState::default(),
+            last_measured_range: 0..0,
         })));
         this.splice(0..0, item_count);
         this
@@ -472,6 +475,16 @@ impl ListState {
         };
         state.items = new_items;
         state.measuring_behavior.reset();
+    }
+
+    /// The items the last layout measured: those in view and those in the overdraw around them.
+    ///
+    /// The layout renders an item in the overdraw only when it has no measured size yet, so an item
+    /// in this range that a frame did not render keeps the size (and the content) it was last
+    /// rendered with. A caller that tracks what its rendered items asked for can use this to tell
+    /// an item the list is still holding from one that left it.
+    pub fn last_measured_range(&self) -> Range<usize> {
+        self.0.borrow().last_measured_range.clone()
     }
 
     /// The number of items in this list.
@@ -1203,6 +1216,7 @@ impl StateInner {
         }
 
         let measured_range = cursor.start().0..(cursor.start().0 + measured_items.len());
+        self.last_measured_range = measured_range.clone();
         let mut cursor = old_items.cursor::<Count>(());
         let mut new_items = cursor.slice(&Count(measured_range.start), Bias::Right);
         new_items.extend(measured_items, ());
