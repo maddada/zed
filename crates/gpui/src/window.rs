@@ -958,6 +958,16 @@ impl TooltipId {
 /// Ghostex: receives the tooltip a frame would show, see [`Window::set_tooltip_presenter`].
 pub type TooltipPresenter = Rc<dyn Fn(Option<(AnyView, Bounds<Pixels>)>, &mut App)>;
 
+/// Ghostex: keeps a window's tooltips hidden while it lives, see [`Window::suppress_tooltips`].
+#[must_use = "tooltips are suppressed only while the guard is held"]
+pub struct TooltipSuppression(Rc<Cell<usize>>);
+
+impl Drop for TooltipSuppression {
+    fn drop(&mut self) {
+        self.0.set(self.0.get().saturating_sub(1));
+    }
+}
+
 pub(crate) struct TooltipBounds {
     id: TooltipId,
     bounds: Bounds<Pixels>,
@@ -1207,6 +1217,7 @@ pub struct Window {
     pub(crate) tooltip_bounds: Option<TooltipBounds>,
     tooltip_presenter: Option<TooltipPresenter>,
     tooltip_presentation: Option<(AnyView, Bounds<Pixels>)>,
+    tooltip_suppressions: Rc<Cell<usize>>,
     frosted_surface: bool,
     frosted_regions: Vec<(Bounds<Pixels>, Pixels)>,
     applied_frosted_regions: Option<Vec<(Bounds<Pixels>, Pixels)>>,
@@ -2085,6 +2096,7 @@ impl Window {
             tooltip_bounds: None,
             tooltip_presenter: None,
             tooltip_presentation: None,
+            tooltip_suppressions: Rc::default(),
             frosted_surface: false,
             frosted_regions: Vec::new(),
             applied_frosted_regions: None,
@@ -3062,6 +3074,21 @@ impl Window {
         self.tooltip_presentation = Some((view, bounds));
     }
 
+    /// Ghostex: hides this window's tooltips, and keeps new ones from showing, until the returned
+    /// guard drops. A menu holds one on the window it was opened from, so a tooltip whose trigger
+    /// was hovered (or pressed) as the menu opened never shows over it.
+    pub fn suppress_tooltips(&mut self) -> TooltipSuppression {
+        self.tooltip_suppressions
+            .set(self.tooltip_suppressions.get() + 1);
+        self.refresh();
+        TooltipSuppression(self.tooltip_suppressions.clone())
+    }
+
+    /// Whether a [`TooltipSuppression`] guard is held for this window.
+    pub fn tooltips_suppressed(&self) -> bool {
+        self.tooltip_suppressions.get() > 0
+    }
+
     /// Mark the window as dirty at the platform level.
     pub fn set_window_edited(&mut self, edited: bool) {
         self.platform_window.set_edited(edited);
@@ -3764,11 +3791,12 @@ impl Window {
             element.prepaint_as_root(offset, AvailableSpace::min_size(), self, cx);
             active_drag_element = Some(element);
             cx.active_drag = Some(active_drag);
-        } else {
+        } else if !self.tooltips_suppressed() {
             tooltip_element = self.prepaint_tooltip(cx);
         }
         if let Some(presenter) = self.tooltip_presenter.clone() {
-            presenter(self.tooltip_presentation.take(), cx);
+            let presentation = self.tooltip_presentation.take();
+            presenter(presentation.filter(|_| !self.tooltips_suppressed()), cx);
         }
 
         self.mouse_hit_test = self.pointer_hit_test(&self.next_frame);

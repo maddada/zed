@@ -3958,7 +3958,7 @@ fn handle_tooltip_mouse_move(
     let action = match active_tooltip.borrow().as_ref() {
         None => {
             let is_hovered = check_is_hovered(window);
-            if is_hovered && phase.bubble() {
+            if is_hovered && phase.bubble() && !window.tooltips_suppressed() {
                 Action::ScheduleShow
             } else {
                 Action::None
@@ -4042,6 +4042,11 @@ fn show_tooltip(
     window: &mut Window,
     cx: &mut App,
 ) -> bool {
+    // A menu opened while this show was pending (a right press on the trigger) owns the window.
+    if window.tooltips_suppressed() {
+        active_tooltip.borrow_mut().take();
+        return false;
+    }
     let new_tooltip = build_tooltip(window, cx).map(|(view, tooltip_is_hoverable)| {
         let weak_active_tooltip = Rc::downgrade(active_tooltip);
         let check_is_hovered_during_prepaint = check_is_hovered_during_prepaint.clone();
