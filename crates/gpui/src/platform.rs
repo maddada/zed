@@ -990,6 +990,12 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn on_appearance_changed(&self, callback: Box<dyn FnMut()>);
     fn on_button_layout_changed(&self, _callback: Box<dyn FnMut()>) {}
     fn draw(&self, scene: &Scene);
+    /// Whether this backend renders offscreen shader effects. Unsupported
+    /// backends paint their children normally instead of dropping content.
+    #[cfg(target_os = "macos")]
+    fn supports_shader_effects(&self) -> bool {
+        false
+    }
     fn schedule_frame(&self) {}
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas>;
     fn is_subpixel_rendering_supported(&self) -> bool;

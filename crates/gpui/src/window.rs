@@ -5287,6 +5287,65 @@ impl Window {
         });
     }
 
+    /// Paints everything `f` draws into an offscreen texture the size of
+    /// `bounds`, runs `effect`'s shaders over it, and composites the result at
+    /// the current z-index, clipped to the current content mask.
+    ///
+    /// Only pixels are redirected: hitboxes, input handlers, layout and element
+    /// state inside `f` work as usual, and the captured primitives keep their
+    /// normal relative order. Anything `f` paints outside `bounds` is cut off.
+    /// Effects don't nest; one painted inside another becomes plain content of
+    /// the outer one. An effect without shaders paints `f` directly.
+    ///
+    /// This method should only be called as part of the paint phase of element drawing.
+    #[cfg(target_os = "macos")]
+    pub fn paint_effect<R>(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        effect: crate::ShaderEffect,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        self.invalidator.debug_assert_paint();
+
+        if effect.shaders.is_empty() || !self.supports_shader_effects() {
+            return f(self);
+        }
+
+        let bounds = self.snap_bounds(bounds);
+        if bounds.size.width.0 <= 0.0
+            || bounds.size.height.0 <= 0.0
+            || bounds.size.width.0 > crate::MAX_SHADER_EFFECT_TEXTURE_SIZE as f32
+            || bounds.size.height.0 > crate::MAX_SHADER_EFFECT_TEXTURE_SIZE as f32
+        {
+            return f(self);
+        }
+        let content_mask = self.snapped_content_mask();
+        self.next_frame
+            .scene
+            .push_effect(effect, bounds, content_mask);
+        let result = f(self);
+        self.next_frame.scene.pop_effect();
+        result
+    }
+
+    /// The size, in device pixels, of the texture [`Window::paint_effect`]
+    /// renders `bounds` into. This is the canvas the shaders see, so use it for
+    /// resolution uniforms.
+    #[cfg(target_os = "macos")]
+    pub fn shader_effect_size(&self, bounds: Bounds<Pixels>) -> Size<DevicePixels> {
+        let bounds = self.snap_bounds(bounds);
+        size(
+            DevicePixels(bounds.size.width.0 as i32),
+            DevicePixels(bounds.size.height.0 as i32),
+        )
+    }
+
+    /// Whether this window's renderer supports the macOS shader-effect API.
+    #[cfg(target_os = "macos")]
+    pub fn supports_shader_effects(&self) -> bool {
+        self.platform_window.supports_shader_effects()
+    }
+
     /// Removes an image from the sprite atlas.
     pub fn drop_image(&mut self, data: Arc<RenderImage>) -> Result<()> {
         for frame_index in 0..data.frame_count() {

@@ -899,6 +899,60 @@ fragment float4 surface_fragment(SurfaceFragmentInput input [[stage_in]],
   return ycbcrToRGBTransform * ycbcr;
 }
 
+struct EffectPassVertexOutput {
+  float4 position [[position]];
+};
+
+// Matches Ghostty's `full_screen_vertex`, which its custom shaders are linked
+// against: one triangle that the viewport clips to the whole target.
+vertex EffectPassVertexOutput effect_pass_vertex(uint vertex_id [[vertex_id]]) {
+  float4 position;
+  position.x = (vertex_id == 2) ? 3.0 : -1.0;
+  position.y = (vertex_id == 0) ? -3.0 : 1.0;
+  position.zw = 1.0;
+  return EffectPassVertexOutput{position};
+}
+
+struct EffectCompositeVertexOutput {
+  float4 position [[position]];
+  float2 texture_position;
+  float clip_distance [[clip_distance]][4];
+};
+
+struct EffectCompositeFragmentInput {
+  float4 position [[position]];
+  float2 texture_position;
+};
+
+vertex EffectCompositeVertexOutput effect_composite_vertex(
+    uint unit_vertex_id [[vertex_id]],
+    constant float2 *unit_vertices [[buffer(EffectCompositeInputIndex_Vertices)]],
+    constant EffectCompositeBounds *effects
+    [[buffer(EffectCompositeInputIndex_Bounds)]],
+    constant Size_DevicePixels *viewport_size
+    [[buffer(EffectCompositeInputIndex_ViewportSize)]]) {
+  float2 unit_vertex = unit_vertices[unit_vertex_id];
+  EffectCompositeBounds effect = effects[0];
+  float4 device_position =
+      to_device_position(unit_vertex, effect.bounds, viewport_size);
+  float4 clip_distance = distance_from_clip_rect(unit_vertex, effect.bounds,
+                                                 effect.content_mask.bounds);
+  return EffectCompositeVertexOutput{
+      device_position,
+      unit_vertex,
+      {clip_distance.x, clip_distance.y, clip_distance.z, clip_distance.w}};
+}
+
+fragment float4 effect_composite_fragment(
+    EffectCompositeFragmentInput input [[stage_in]],
+    texture2d<float> effect_texture
+    [[texture(EffectCompositeInputIndex_Texture)]]) {
+  // The texture has exactly the size of the effect bounds, so nearest
+  // sampling copies it pixel for pixel.
+  constexpr sampler effect_sampler(mag_filter::nearest, min_filter::nearest);
+  return effect_texture.sample(effect_sampler, input.texture_position);
+}
+
 float4 hsla_to_rgba(Hsla hsla) {
   float h = hsla.h * 6.0; // Now, it's an angle but scaled in [0, 6) range
   float s = hsla.s;
