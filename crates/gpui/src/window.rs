@@ -1223,6 +1223,9 @@ pub struct Window {
     applied_frosted_regions: Option<Vec<(Bounds<Pixels>, Pixels)>>,
     pub(crate) next_frame_callbacks: Rc<RefCell<Vec<FrameCallback>>>,
     pub(crate) dirty_views: FxHashSet<EntityId>,
+    /// The views notified for this draw, as opposed to those in `dirty_views` only because a view
+    /// inside them was notified; see [`Window::view_was_notified`].
+    notified_views: FxHashSet<EntityId>,
     focus_listeners: SubscriberSet<(), AnyWindowFocusListener>,
     pub(crate) focus_lost_listeners: SubscriberSet<(), AnyObserver>,
     focus_lost_path: SmallVec<[FocusId; 8]>,
@@ -2101,6 +2104,7 @@ impl Window {
             frosted_regions: Vec::new(),
             applied_frosted_regions: None,
             dirty_views: FxHashSet::default(),
+            notified_views: FxHashSet::default(),
             focus_listeners: SubscriberSet::new(),
             focus_lost_listeners: SubscriberSet::new(),
             focus_lost_path: SmallVec::new(),
@@ -2654,6 +2658,16 @@ impl Window {
     /// regardless of what else asks for a frame.
     pub fn view_is_pending_render(&self, view: EntityId) -> bool {
         self.invalidator.view_is_dirty(view) || self.dirty_views.contains(&view)
+    }
+
+    /// Whether `view` itself was notified for the frame being drawn.
+    ///
+    /// A view also renders when a view inside it was notified (notifying marks every ancestor
+    /// dirty), when its parent renders it uncached, and when the window refreshes. A view that
+    /// keeps a cached descendant can use this to draw the descendant again only when its own
+    /// state may have changed.
+    pub fn view_was_notified(&self, view: EntityId) -> bool {
+        self.notified_views.contains(&view)
     }
 
     /// Renders `view` in the frame being drawn even if it was drawn cached and nothing notified it.
@@ -3654,6 +3668,7 @@ impl Window {
 
     fn invalidate_entities(&mut self) {
         let mut views = self.invalidator.take_views();
+        self.notified_views.clone_from(&views);
         for entity in views.drain() {
             self.mark_view_dirty(entity);
         }
