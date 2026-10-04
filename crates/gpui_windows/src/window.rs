@@ -134,6 +134,8 @@ pub struct WindowsWindowState {
     initial_placement: Cell<Option<WindowOpenStatus>>,
     hwnd: HWND,
     pub(crate) a11y: RefCell<Option<A11yState>>,
+    /// Ghostex: the blur windows under a frosted surface's rounded rects.
+    pub(crate) frosted_backdrops: FrostedBackdrops,
 }
 
 pub(crate) struct WindowsWindowInner {
@@ -234,6 +236,7 @@ impl WindowsWindowState {
             draw_coordinator,
             direct_manipulation,
             a11y: RefCell::new(None),
+            frosted_backdrops: FrostedBackdrops::default(),
         })
     }
 
@@ -448,7 +451,8 @@ pub(crate) struct Callbacks {
     pub(crate) moved: Cell<Option<Box<dyn FnMut()>>>,
     pub(crate) should_close: Cell<Option<Box<dyn FnMut() -> bool>>>,
     pub(crate) close: Cell<Option<Box<dyn FnOnce()>>>,
-    pub(crate) hit_test_window_control: Cell<Option<Box<dyn FnMut(gpui::Point<gpui::Pixels>) -> Option<WindowControlArea>>>>,
+    pub(crate) hit_test_window_control:
+        Cell<Option<Box<dyn FnMut(gpui::Point<gpui::Pixels>) -> Option<WindowControlArea>>>>,
     pub(crate) appearance_changed: Cell<Option<Box<dyn FnMut()>>>,
 }
 
@@ -998,6 +1002,15 @@ impl PlatformWindow for WindowsWindow {
                 dwm_set_window_composition_attribute(hwnd, 4);
             }
         }
+        // Ghostex: a frosted surface's blur is drawn by its blur windows; its own accent stays clear.
+        if self.state.frosted_backdrops.set(
+            hwnd,
+            None,
+            background_appearance == WindowBackgroundAppearance::Blurred,
+            self.state.scale_factor.get(),
+        ) {
+            set_window_composition_attribute(hwnd, None, 2);
+        }
         self.update_backdrop(|request| {
             request.blurred = background_appearance == WindowBackgroundAppearance::Blurred;
         });
@@ -1033,12 +1046,29 @@ impl PlatformWindow for WindowsWindow {
     }
 
     // Ghostex: a frosted surface keeps its blur, and everything it draws, inside the rounded rects
-    // it reports each frame (a tooltip host is exactly its bubble, a toast stack its cards). Windows
-    // can only confine a window's blur by clipping the window, so the window's region is set to
-    // their union; an empty list gives the whole window back.
+    // it reports each frame (a tooltip host is exactly its bubble, a toast stack its cards). DWM
+    // draws a window's acrylic over its whole rectangle whatever its region, so the blur moves to
+    // a rounded blur window per rect (`frosted_backdrop.rs`) and the window's own accent turns
+    // clear; the window's region, their union, still clips what it draws and where it takes the
+    // mouse. An empty list gives the whole window, and its own blur, back.
     fn set_background_blur_region(&self, region: Vec<(Bounds<Pixels>, Pixels)>) {
         let hwnd = self.0.hwnd;
         let scale = self.state.scale_factor.get();
+        if self.state.background_appearance.get() == WindowBackgroundAppearance::Blurred {
+            let backdrops =
+                self.state
+                    .frosted_backdrops
+                    .set(hwnd, Some(region.clone()), true, scale);
+            if backdrops {
+                set_window_composition_attribute(hwnd, None, 2);
+            } else {
+                set_window_composition_attribute(hwnd, Some((0, 0, 0, 0)), 4);
+            }
+        } else {
+            self.state
+                .frosted_backdrops
+                .set(hwnd, Some(region.clone()), false, scale);
+        }
         unsafe {
             if region.is_empty() {
                 SetWindowRgn(hwnd, None, true);
@@ -1163,7 +1193,10 @@ impl PlatformWindow for WindowsWindow {
         self.state.callbacks.close.set(Some(callback));
     }
 
-    fn on_hit_test_window_control(&self, callback: Box<dyn FnMut(gpui::Point<gpui::Pixels>) -> Option<WindowControlArea>>) {
+    fn on_hit_test_window_control(
+        &self,
+        callback: Box<dyn FnMut(gpui::Point<gpui::Pixels>) -> Option<WindowControlArea>>,
+    ) {
         self.0
             .state
             .callbacks
@@ -1645,7 +1678,7 @@ pub(crate) fn window_from_hwnd(hwnd: HWND) -> Option<Rc<WindowsWindowInner>> {
     }
 }
 
-fn get_module_handle() -> HMODULE {
+pub(crate) fn get_module_handle() -> HMODULE {
     unsafe {
         let mut h_module = std::mem::zeroed();
         GetModuleHandleExW(
@@ -1771,7 +1804,7 @@ fn dwm_set_window_composition_attribute(hwnd: HWND, backdrop_type: u32) {
     }
 }
 
-fn set_window_composition_attribute(hwnd: HWND, color: Option<Color>, state: u32) {
+pub(crate) fn set_window_composition_attribute(hwnd: HWND, color: Option<Color>, state: u32) {
     let mut version = unsafe { std::mem::zeroed() };
     let status = unsafe { windows::Wdk::System::SystemServices::RtlGetVersion(&mut version) };
 

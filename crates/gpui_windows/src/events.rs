@@ -96,6 +96,14 @@ impl WindowsWindowInner {
             WM_MOUSEACTIVATE => Some(MA_ACTIVATE as isize),
             WM_ACTIVATE => self.handle_activate_msg(wparam),
             WM_CREATE => self.handle_create_msg(handle),
+            WM_WINDOWPOSCHANGED => {
+                // Ghostex: a frosted surface's blur windows follow it (`frosted_backdrop.rs`).
+                // `DefWindowProc` still turns this into `WM_MOVE` and `WM_SIZE`.
+                self.state
+                    .frosted_backdrops
+                    .sync(handle, self.state.scale_factor.get());
+                None
+            }
             WM_MOVE => self.handle_move_msg(handle, lparam),
             WM_SIZE => self.handle_size_msg(wparam, lparam),
             WM_GETMINMAXINFO => self.handle_get_min_max_info_msg(lparam),
@@ -345,6 +353,7 @@ impl WindowsWindowInner {
     }
 
     fn handle_destroy_msg(&self, handle: HWND) -> Option<isize> {
+        self.state.frosted_backdrops.clear();
         let callback = { self.state.callbacks.close.take() };
         // Re-enable parent window if this was a modal dialog
         if let Some(parent_hwnd) = self.parent_hwnd {
