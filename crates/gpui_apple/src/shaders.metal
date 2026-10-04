@@ -622,6 +622,7 @@ struct MonochromeSpriteVertexOutput {
   float4 position [[position]];
   float2 tile_position;
   float4 color [[flat]];
+  float4 tile_texel_bounds [[flat]];
   float4 clip_distance;
 };
 
@@ -629,6 +630,7 @@ struct MonochromeSpriteFragmentInput {
   float4 position [[position]];
   float2 tile_position;
   float4 color [[flat]];
+  float4 tile_texel_bounds [[flat]];
   float4 clip_distance;
 };
 
@@ -648,10 +650,20 @@ vertex MonochromeSpriteVertexOutput monochrome_sprite_vertex(
                                                  sprite.content_mask.bounds, sprite.transformation);
   float2 tile_position = to_tile_position(unit_vertex, sprite.tile, atlas_size);
   float4 color = hsla_to_rgba(sprite.color);
+  // Atlas tiles are packed with no gutter, so a bilinear sample within half a texel of a tile's
+  // edge blends in the neighbouring tile. Unrotated sprites never sample that close, but a rotated
+  // or scaled one does along its whole outline, which showed as a flickering square around
+  // spinning icons. The fragment clamps to the centres of the tile's edge texels.
+  float2 atlas = float2((float)atlas_size->width, (float)atlas_size->height);
+  float2 tile_origin = float2(sprite.tile.bounds.origin.x, sprite.tile.bounds.origin.y);
+  float2 tile_size = float2(sprite.tile.bounds.size.width, sprite.tile.bounds.size.height);
+  float4 tile_texel_bounds = float4((tile_origin + 0.5) / atlas,
+                                    (tile_origin + tile_size - 0.5) / atlas);
   return MonochromeSpriteVertexOutput{
       device_position,
       tile_position,
       color,
+      tile_texel_bounds,
       {clip_distance.x, clip_distance.y, clip_distance.z, clip_distance.w}};
 }
 
@@ -665,8 +677,9 @@ fragment float4 monochrome_sprite_fragment(
 
   constexpr sampler atlas_texture_sampler(mag_filter::linear,
                                           min_filter::linear);
-  float4 sample =
-      atlas_texture.sample(atlas_texture_sampler, input.tile_position);
+  float2 tile_position = clamp(input.tile_position, input.tile_texel_bounds.xy,
+                               input.tile_texel_bounds.zw);
+  float4 sample = atlas_texture.sample(atlas_texture_sampler, tile_position);
   float4 color = input.color;
   color.a *= sample.a;
   return color;
