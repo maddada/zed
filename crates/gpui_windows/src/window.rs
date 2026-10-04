@@ -547,8 +547,13 @@ impl WindowsWindow {
                 .unwrap_or(""),
         );
 
+        // CDXC:PlatformSupport 2026-10-04 WHY:
+        // An owned window always stays above its owner, so `WS_EX_TOPMOST` on an owned pop-up only made it float over every other app's windows: Ghostex's menus, tooltips and the chat's scroll-to-bottom pill stayed on screen after Alt+Tab. An owned pop-up now goes behind other apps together with its owner; a pop-up opened with no active window (a capture overlay summoned over another app) has nothing to ride with and stays topmost.
         let (mut dwexstyle, dwstyle) = if params.kind == WindowKind::PopUp {
-            let mut dwexstyle = WS_EX_TOOLWINDOW | WS_EX_TOPMOST;
+            let mut dwexstyle = WS_EX_TOOLWINDOW;
+            if native_owner_hwnd.is_none() {
+                dwexstyle |= WS_EX_TOPMOST;
+            }
             if !params.focus {
                 dwexstyle |= WS_EX_NOACTIVATE;
             }
