@@ -126,7 +126,7 @@ impl WindowsWindowInner {
             // If you don't interact with any elements, this will fall through to the windows default
             // behavior of toggling whether the window is maximized.
             WM_NCLBUTTONDBLCLK | WM_NCLBUTTONDOWN => {
-                self.handle_nc_mouse_down_msg(handle, MouseButton::Left, wparam, lparam)
+                self.handle_nc_left_button_down_msg(handle, msg, wparam, lparam)
             }
             WM_NCRBUTTONDOWN => {
                 self.handle_nc_mouse_down_msg(handle, MouseButton::Right, wparam, lparam)
@@ -1154,6 +1154,65 @@ impl WindowsWindowInner {
         } else {
             None
         }
+    }
+
+    /// CDXC:PlatformSupport 2026-10-05 WHY:
+    /// A left press on the caption or a sizing border is answered by `DefWindowProc` with the system move or size loop, which eats the button release: no `WM_NCLBUTTONUP` or `WM_LBUTTONUP` ever arrives. GPUI had already dispatched the press, so anything that began a gesture on it (the window text-selection layer starts a selection on any press that reaches the root) never saw it end, and plain mouse moves afterwards kept extending a selection in the chat transcript. The loop is run here instead, and the release it swallowed is dispatched once it returns. A double click there gets the same release right after `DefWindowProc` maximizes or restores the window, because the resize can leave the pointer outside the window, where its real release is never seen.
+    fn handle_nc_left_button_down_msg(
+        &self,
+        handle: HWND,
+        msg: u32,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> Option<isize> {
+        if let Some(result) =
+            self.handle_nc_mouse_down_msg(handle, MouseButton::Left, wparam, lparam)
+        {
+            return Some(result);
+        }
+        if !matches!(
+            wparam.0 as u32,
+            HTCAPTION
+                | HTLEFT
+                | HTRIGHT
+                | HTTOP
+                | HTTOPLEFT
+                | HTTOPRIGHT
+                | HTBOTTOM
+                | HTBOTTOMLEFT
+                | HTBOTTOMRIGHT
+        ) {
+            return None;
+        }
+        unsafe { DefWindowProcW(handle, msg, wparam, lparam) };
+        self.dispatch_swallowed_left_release(handle);
+        Some(0)
+    }
+
+    fn dispatch_swallowed_left_release(&self, handle: HWND) -> Option<()> {
+        let mut position = POINT::default();
+        unsafe {
+            GetCursorPos(&mut position)
+                .context("unable to get mouse position after the move loop")
+                .log_err()?;
+            ScreenToClient(handle, &mut position)
+                .ok()
+                .context("unable to convert mouse position after the move loop")
+                .log_err()?;
+        }
+        let mut func = self.state.callbacks.input.take()?;
+        func(PlatformInput::MouseUp(MouseUpEvent {
+            button: MouseButton::Left,
+            position: logical_point(
+                position.x as f32,
+                position.y as f32,
+                self.state.scale_factor.get(),
+            ),
+            modifiers: current_modifiers(),
+            click_count: self.state.click_state.current_count.get(),
+        }));
+        self.state.callbacks.input.set(Some(func));
+        Some(())
     }
 
     fn handle_nc_mouse_up_msg(
