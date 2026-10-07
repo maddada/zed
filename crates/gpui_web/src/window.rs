@@ -32,7 +32,8 @@ pub(crate) struct WebWindowCallbacks {
     pub(crate) should_close: Option<Box<dyn FnMut() -> bool>>,
     pub(crate) close: Option<Box<dyn FnOnce()>>,
     pub(crate) appearance_changed: Option<Box<dyn FnMut()>>,
-    pub(crate) hit_test_window_control: Option<Box<dyn FnMut(gpui::Point<gpui::Pixels>) -> Option<WindowControlArea>>>,
+    pub(crate) hit_test_window_control:
+        Option<Box<dyn FnMut(gpui::Point<gpui::Pixels>) -> Option<WindowControlArea>>>,
 }
 
 pub(crate) struct WebWindowMutableState {
@@ -499,8 +500,8 @@ impl WebWindowInner {
     }
 
     pub(crate) fn refresh_active_status(&self) {
-        let active = self.state.borrow().holds_page_keyboard
-            && document_is_active(&self.browser_window);
+        let active =
+            self.state.borrow().holds_page_keyboard && document_is_active(&self.browser_window);
         if std::mem::replace(&mut self.state.borrow_mut().is_active, active) != active {
             self.with_callback(
                 |callbacks| &mut callbacks.active_status_change,
@@ -1088,7 +1089,10 @@ impl PlatformWindow for WebWindow {
         self.inner.callbacks.borrow_mut().close = Some(callback);
     }
 
-    fn on_hit_test_window_control(&self, callback: Box<dyn FnMut(gpui::Point<gpui::Pixels>) -> Option<WindowControlArea>>) {
+    fn on_hit_test_window_control(
+        &self,
+        callback: Box<dyn FnMut(gpui::Point<gpui::Pixels>) -> Option<WindowControlArea>>,
+    ) {
         self.inner.callbacks.borrow_mut().hit_test_window_control = Some(callback);
     }
 

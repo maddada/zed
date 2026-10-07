@@ -1237,7 +1237,12 @@ impl WebWindowInner {
             };
             // Focus moving onto the accessibility mirror (a driver focusing a mirrored text
             // field, which replays its keys and text on this input) keeps the window active.
-            if target.closest("[data-gpui-a11y-root]").ok().flatten().is_some() {
+            if target
+                .closest("[data-gpui-a11y-root]")
+                .ok()
+                .flatten()
+                .is_some()
+            {
                 return;
             }
             this.state.borrow_mut().holds_page_keyboard = false;
