@@ -141,7 +141,7 @@ pub struct TouchEvent {
     /// Without it the time the event is processed is used, and touches that
     /// queued behind a slow frame arrive with compressed times, which can
     /// turn a fling into a plain drag.
-    pub timestamp: Option<web_time::Instant>,
+    pub timestamp: Option<scheduler::Instant>,
 }
 
 impl Sealed for TouchEvent {}

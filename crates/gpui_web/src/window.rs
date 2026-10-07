@@ -9,12 +9,12 @@ use std::sync::Arc;
 use std::{cell::Cell, cell::RefCell, rc::Rc};
 
 use gpui::{
-    AnyWindowHandle, Bounds, Capslock, Decorations, DevicePixels, DispatchEventResult, GpuSpecs,
-    Modifiers, MouseButton, Pixels, PlatformAtlas, PlatformDisplay, PlatformInput,
-    PlatformInputHandler, PlatformWindow, Point, PromptButton, PromptLevel, RequestFrameOptions,
-    ResizeEdge, Scene, Size, TextInputConfiguration, TextInputStateChange, WindowAppearance,
-    WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowControls, WindowDecorations,
-    WindowInsets, WindowParams, WindowVisibility, px,
+    AnyWindowHandle, Bounds, Capslock, Decorations, DevicePixels, DispatchEventResult,
+    FrameRequestSource, GpuSpecs, Modifiers, MouseButton, Pixels, PlatformAtlas, PlatformDisplay,
+    PlatformInput, PlatformInputHandler, PlatformWindow, Point, PromptButton, PromptLevel,
+    RequestFrameOptions, ResizeEdge, Scene, Size, TextInputConfiguration, TextInputStateChange,
+    WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowControls,
+    WindowDecorations, WindowInsets, WindowParams, WindowVisibility, px,
 };
 use gpui_wgpu::{WgpuContext, WgpuRenderer, WgpuSurfaceConfig, wgpu};
 use wasm_bindgen::prelude::*;
@@ -44,6 +44,10 @@ pub(crate) struct WebWindowMutableState {
     pub(crate) input_handler: Option<PlatformInputHandler>,
     pub(crate) is_fullscreen: bool,
     pub(crate) is_active: bool,
+    /// Whether this window's canvas holds the page's keyboard, as a native key window does:
+    /// an overlay window opened with focus takes it from the window under it. The window is
+    /// active while it holds the keyboard and the page itself is active.
+    pub(crate) holds_page_keyboard: bool,
     pub(crate) visibility: WindowVisibility,
     pub(crate) is_hovered: bool,
     pub(crate) mouse_position: Point<Pixels>,
@@ -247,7 +251,8 @@ impl WebWindow {
             title: String::new(),
             input_handler: None,
             is_fullscreen: false,
-            is_active: takes_focus,
+            is_active: takes_focus && document_is_active(&browser_window),
+            holds_page_keyboard: takes_focus,
             visibility: document_visibility(&browser_window),
             is_hovered: false,
             mouse_position: Point::default(),
@@ -462,6 +467,8 @@ impl WebWindow {
                     callback(RequestFrameOptions {
                         require_presentation: true,
                         force_render: true,
+                        signal_at: None,
+                        signal_source: FrameRequestSource::NativeCallback,
                     })
                 },
             );
@@ -489,6 +496,17 @@ impl WebWindowInner {
             |callbacks| &mut callbacks.visual_viewport_changed,
             |callback| callback(),
         );
+    }
+
+    pub(crate) fn refresh_active_status(&self) {
+        let active = self.state.borrow().holds_page_keyboard
+            && document_is_active(&self.browser_window);
+        if std::mem::replace(&mut self.state.borrow_mut().is_active, active) != active {
+            self.with_callback(
+                |callbacks| &mut callbacks.active_status_change,
+                |callback| callback(active),
+            );
+        }
     }
 
     /// Invokes a registered callback with take/call/restore semantics.
@@ -523,6 +541,8 @@ impl WebWindowInner {
                     callback(RequestFrameOptions {
                         require_presentation: false,
                         force_render: false,
+                        signal_at: None,
+                        signal_source: FrameRequestSource::NativeCallback,
                     })
                 },
             );
@@ -592,17 +612,11 @@ impl WebWindowInner {
             "visibilitychange",
             move |_event: JsValue| {
                 let visibility = document_visibility(&this.browser_window);
-                let is_visible = visibility.is_visible();
-
                 let visibility_changed = {
                     let mut state = this.state.borrow_mut();
-                    state.is_active = is_visible;
                     std::mem::replace(&mut state.visibility, visibility) != visibility
                 };
-                this.with_callback(
-                    |callbacks| &mut callbacks.active_status_change,
-                    |callback| callback(is_visible),
-                );
+                this.refresh_active_status();
                 if visibility_changed {
                     this.with_callback(
                         |callbacks| &mut callbacks.visibility_change,
@@ -738,6 +752,14 @@ fn document_visibility(browser_window: &web_sys::Window) -> WindowVisibility {
     } else {
         WindowVisibility::Hidden
     }
+}
+
+fn document_is_active(browser_window: &web_sys::Window) -> bool {
+    document_visibility(browser_window).is_visible()
+        && browser_window
+            .document()
+            .and_then(|document| document.has_focus().ok())
+            .unwrap_or(true)
 }
 
 struct MqlHandle {
@@ -960,7 +982,9 @@ impl PlatformWindow for WebWindow {
     }
 
     fn activate(&self) {
-        self.inner.state.borrow_mut().is_active = true;
+        let mut state = self.inner.state.borrow_mut();
+        state.holds_page_keyboard = true;
+        state.is_active = true;
     }
 
     fn is_active(&self) -> bool {

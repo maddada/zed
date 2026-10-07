@@ -166,6 +166,8 @@ impl WebWindowInner {
             self.register_composition_end(),
             self.register_focus(),
             self.register_blur(),
+            self.register_input_focus(),
+            self.register_input_blur(),
             self.register_pointer_enter(),
         ];
         handles.extend(self.register_selection_change());
@@ -471,10 +473,13 @@ impl WebWindowInner {
 
     /// Cancels touch default handling separately because iOS does not consistently
     /// transfer pointer-event cancellation to the corresponding touch event.
+    /// During native scrolling, touchend may be non-cancelable.
     fn register_touch_end(self: &Rc<Self>) -> EventListenerHandle {
         self.listen_non_passive("touchend", move |event: JsValue| {
             let event: web_sys::Event = event.unchecked_into();
-            event.prevent_default();
+            if event.cancelable() {
+                event.prevent_default();
+            }
         })
     }
 
@@ -527,11 +532,7 @@ impl WebWindowInner {
         let callback = wasm_bindgen::closure::Closure::once_into_js({
             let this = Rc::clone(self);
             move || {
-                this.state.borrow_mut().is_active = true;
-                this.with_callback(
-                    |callbacks| &mut callbacks.active_status_change,
-                    |callback| callback(true),
-                );
+                this.refresh_active_status();
             }
         });
         if let Err(error) = self
@@ -727,6 +728,20 @@ impl WebWindowInner {
 
             let is_held = event.repeat();
             let key_char = compute_key_char(&event, &key, &modifiers);
+
+            // The software keyboard must edit the mirror itself: cancelling
+            // keydown prevents iOS from updating its autocorrect context and
+            // from delivering the corresponding beforeinput/input events.
+            if this.touch_input
+                && this.ime_mirror.virtual_keyboard_enabled()
+                && this.state.borrow().input_handler.is_some()
+                && !modifiers.platform
+                && !modifiers.control
+                && !modifiers.alt
+                && (key_char.is_some() || matches!(key.as_str(), "backspace" | "delete" | "enter"))
+            {
+                return;
+            }
 
             let keystroke = Keystroke {
                 modifiers,
@@ -1165,45 +1180,68 @@ impl WebWindowInner {
 
     fn register_focus(self: &Rc<Self>) -> EventListenerHandle {
         let this = Rc::clone(self);
+        EventListenerHandle::add(
+            self.browser_window.as_ref(),
+            "focus",
+            move |_event: JsValue| {
+                if this.suppress_focus_status_events.get() {
+                    return;
+                }
+                this.refresh_active_status();
+            },
+        )
+    }
+
+    fn register_blur(self: &Rc<Self>) -> EventListenerHandle {
+        let this = Rc::clone(self);
+        EventListenerHandle::add(
+            self.browser_window.as_ref(),
+            "blur",
+            move |_event: JsValue| {
+                if this.suppress_focus_status_events.get() {
+                    return;
+                }
+                this.refresh_active_status();
+            },
+        )
+    }
+
+    /// This window's text input gaining focus means its canvas took the page's keyboard: an
+    /// overlay window opening with focus, or a click back into the window under it.
+    fn register_input_focus(self: &Rc<Self>) -> EventListenerHandle {
+        let this = Rc::clone(self);
         self.listen_input("focus", move |_event: JsValue| {
             if this.suppress_focus_status_events.get() {
                 return;
             }
-            {
-                let mut state = this.state.borrow_mut();
-                state.is_active = true;
-            }
-            this.with_callback(
-                |callbacks| &mut callbacks.active_status_change,
-                |callback| callback(true),
-            );
+            this.state.borrow_mut().holds_page_keyboard = true;
+            this.refresh_active_status();
         })
     }
 
-    fn register_blur(self: &Rc<Self>) -> EventListenerHandle {
+    /// Only another element of the page taking the focus (another window's input, as when an
+    /// overlay window opens or the user clicks back into the window under it) gives up the
+    /// keyboard. Focus leaving the page is the browser window's blur, and a dismissed software
+    /// keyboard blurs the input without a new target; neither deactivates this window here.
+    fn register_input_blur(self: &Rc<Self>) -> EventListenerHandle {
         let this = Rc::clone(self);
         self.listen_input("blur", move |event: JsValue| {
             if this.suppress_focus_status_events.get() {
                 return;
             }
-            // Focus moving onto this window's accessibility mirror (a driver focusing a mirrored
-            // text field, which replays its keys and text on this input) keeps the window active.
-            let moves_to_mirror = js_sys::Reflect::get(&event, &"relatedTarget".into())
+            let Some(target) = js_sys::Reflect::get(&event, &"relatedTarget".into())
                 .ok()
                 .and_then(|target| target.dyn_into::<web_sys::Element>().ok())
-                .and_then(|target| target.closest("[data-gpui-a11y-root]").ok().flatten())
-                .is_some();
-            if moves_to_mirror {
+            else {
+                return;
+            };
+            // Focus moving onto the accessibility mirror (a driver focusing a mirrored text
+            // field, which replays its keys and text on this input) keeps the window active.
+            if target.closest("[data-gpui-a11y-root]").ok().flatten().is_some() {
                 return;
             }
-            {
-                let mut state = this.state.borrow_mut();
-                state.is_active = false;
-            }
-            this.with_callback(
-                |callbacks| &mut callbacks.active_status_change,
-                |callback| callback(false),
-            );
+            this.state.borrow_mut().holds_page_keyboard = false;
+            this.refresh_active_status();
         })
     }
 
