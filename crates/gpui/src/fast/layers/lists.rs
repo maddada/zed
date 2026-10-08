@@ -1397,6 +1397,26 @@ fn drawn_alike(a: &Row, b: &Row) -> bool {
                     size: bounds.size,
                 }),
                 PaintOperation::EndLayer => PaintOperation::EndLayer,
+                #[cfg(target_os = "macos")]
+                PaintOperation::StartEffect {
+                    effect,
+                    bounds,
+                    content_mask,
+                } => PaintOperation::StartEffect {
+                    effect: effect.clone(),
+                    bounds: Bounds {
+                        origin: bounds.origin + to_row,
+                        size: bounds.size,
+                    },
+                    content_mask: ContentMask {
+                        bounds: Bounds {
+                            origin: content_mask.bounds.origin + to_row,
+                            size: content_mask.bounds.size,
+                        },
+                    },
+                },
+                #[cfg(target_os = "macos")]
+                PaintOperation::EndEffect => PaintOperation::EndEffect,
             })
             .collect();
         let (tiles, _) = part_tile_hashes(&operations, paint::TILE_SIZE);
@@ -2509,6 +2529,17 @@ pub(crate) fn end_paint_rows(window: &mut Window, cx: &mut App, id: Option<&Glob
                 PaintOperation::Primitive(primitive) => move_primitive(primitive, to_content),
                 PaintOperation::StartLayer(bounds) => bounds.origin = bounds.origin + to_content,
                 PaintOperation::EndLayer => {}
+                #[cfg(target_os = "macos")]
+                PaintOperation::StartEffect {
+                    bounds,
+                    content_mask,
+                    ..
+                } => {
+                    bounds.origin = bounds.origin + to_content;
+                    content_mask.bounds.origin = content_mask.bounds.origin + to_content;
+                }
+                #[cfg(target_os = "macos")]
+                PaintOperation::EndEffect => {}
             }
         }
         let (tile_hashes, reach) = part_tile_hashes(&row_operations, paint::TILE_SIZE);

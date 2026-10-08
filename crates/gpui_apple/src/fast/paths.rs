@@ -91,6 +91,8 @@ pub(crate) fn draw_primitives_to_texture(
         Some(metal::MTLClearColor::new(0., 0., 0., alpha)),
     );
     let mut path_batches = path_batches.iter().enumerate();
+    // The textures `rasterize_group` draws into, which the paths are copied from.
+    let path_textures = renderer.window_path_textures();
 
     for batch in scene.batches() {
         match batch {
@@ -133,6 +135,7 @@ pub(crate) fn draw_primitives_to_texture(
                     writer,
                     viewport_size,
                     command_encoder,
+                    &path_textures,
                 ) {
                     command_encoder.end_encoding();
                     return Err(error);

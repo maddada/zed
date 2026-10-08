@@ -438,14 +438,17 @@ impl Scene {
     /// so `len() == 0` is not equivalent to having no visible/input-relevant
     /// overlay content.
     pub fn is_empty(&self) -> bool {
-        self.shadows.is_empty()
+        let empty = self.shadows.is_empty()
             && self.quads.is_empty()
             && self.paths.is_empty()
             && self.underlines.is_empty()
             && self.monochrome_sprites.is_empty()
             && self.subpixel_sprites.is_empty()
             && self.polychrome_sprites.is_empty()
-            && self.surfaces.is_empty()
+            && self.surfaces.is_empty();
+        #[cfg(target_os = "macos")]
+        let empty = empty && self.effects.is_empty();
+        empty
     }
 
     /// Replays a range as a self-contained scene, restoring any layers that
@@ -475,6 +478,10 @@ impl Scene {
                     );
                 }
                 PaintOperation::Primitive(_) => {}
+                // An effect opens and closes inside one element's paint, so a
+                // replayed range holds whole effects and none is left open.
+                #[cfg(target_os = "macos")]
+                PaintOperation::StartEffect { .. } | PaintOperation::EndEffect => {}
             }
         }
 
@@ -496,6 +503,16 @@ impl Scene {
                     );
                     self.pop_layer();
                 }
+                // Replayed as `Scene::replay` does: this scene is drawn by the
+                // window's renderer, which shades effect groups.
+                #[cfg(target_os = "macos")]
+                PaintOperation::StartEffect {
+                    effect,
+                    bounds,
+                    content_mask,
+                } => self.push_effect(effect.clone(), *bounds, *content_mask),
+                #[cfg(target_os = "macos")]
+                PaintOperation::EndEffect => self.pop_effect(),
             }
         }
         for _ in active_layers {

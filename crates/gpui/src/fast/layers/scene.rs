@@ -125,6 +125,9 @@ impl LayerFrame {
                     scene.push_layer(translate_bounds(*layer_bounds, delta))
                 }
                 PaintOperation::EndLayer => scene.pop_layer(),
+                // Drawn plain in a layer; see `paint::draw_into_frame`.
+                #[cfg(target_os = "macos")]
+                PaintOperation::StartEffect { .. } | PaintOperation::EndEffect => {}
             }
         }
         scene.finish();
@@ -350,6 +353,14 @@ pub(crate) fn move_primitive(primitive: &mut Primitive, delta: Point<ScaledPixel
         Primitive::Surface(surface) => {
             mv(&mut surface.bounds);
             mv(&mut surface.content_mask.bounds);
+        }
+        // An effect group is placed by `Scene::pop_effect` and never recorded
+        // as a paint operation, so no layer moves one; its captured scene
+        // would stay where it was.
+        #[cfg(target_os = "macos")]
+        Primitive::Effect(effect) => {
+            mv(&mut effect.bounds);
+            mv(&mut effect.content_mask.bounds);
         }
     }
 }

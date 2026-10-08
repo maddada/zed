@@ -471,6 +471,15 @@ impl MetalRenderer {
         crate::fast::layers::TileCache::clear(&mut self.fast_layers);
     }
 
+    /// The window-sized textures paths drawn straight into the window, or
+    /// into a texture of its size, are rasterized through.
+    pub(crate) fn window_path_textures(&self) -> PathIntermediateTextures {
+        PathIntermediateTextures {
+            texture: self.path_intermediate_texture.clone(),
+            msaa_texture: self.path_intermediate_msaa_texture.clone(),
+        }
+    }
+
     fn update_path_intermediate_textures(&mut self, size: Size<DevicePixels>) {
         // We are uncertain when this happens, but sometimes size can be 0 here. Most likely before
         // the layout pass on window creation. Zero-sized texture creation causes SIGABRT.
@@ -747,10 +756,7 @@ impl MetalRenderer {
         let command_queue = self.command_queue.clone();
         let command_buffer = command_queue.new_command_buffer();
         let alpha = if self.opaque { 1. } else { 0. };
-        let path_textures = PathIntermediateTextures {
-            texture: self.path_intermediate_texture.clone(),
-            msaa_texture: self.path_intermediate_msaa_texture.clone(),
-        };
+        let path_textures = self.window_path_textures();
 
         self.encode_scene(
             scene,
@@ -1635,7 +1641,7 @@ struct EffectPipeline {
 /// They must match the target's size, because the path sprite shader maps
 /// positions to texture coordinates through the viewport size.
 #[derive(Clone, Default)]
-struct PathIntermediateTextures {
+pub(crate) struct PathIntermediateTextures {
     texture: Option<metal::Texture>,
     msaa_texture: Option<metal::Texture>,
 }
