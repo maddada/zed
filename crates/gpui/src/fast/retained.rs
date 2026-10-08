@@ -240,6 +240,29 @@ pub(crate) struct RetainedState {
     pub(crate) rendering_since: FxHashMap<EntityId, u64>,
 }
 
+/// Ghostex: the retention a new window starts with, once the host has chosen it
+/// ([`set_default_view_retention`]): 0 unset, 1 off, 2 on.
+static DEFAULT_VIEW_RETENTION: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Ghostex: sets whether windows opened from now on draw views again from the last frame
+/// (see [`Window::set_view_retention`]), in place of the `GPUI_VIEW_RETENTION` environment
+/// variable. Windows already open keep theirs; the host updates them with
+/// [`Window::set_view_retention`].
+pub fn set_default_view_retention(enabled: bool) {
+    DEFAULT_VIEW_RETENTION.store(
+        if enabled { 2 } else { 1 },
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+fn default_view_retention() -> bool {
+    match DEFAULT_VIEW_RETENTION.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => false,
+        2 => true,
+        _ => std::env::var("GPUI_VIEW_RETENTION").map_or(true, |value| value != "0"),
+    }
+}
+
 impl RetainedState {
     pub(crate) fn new(cx: &App) -> Self {
         RetainedState {
@@ -252,7 +275,7 @@ impl RetainedState {
             open_paints: Vec::new(),
             prebuilt: FxHashMap::default(),
             notified_entities: FxHashSet::default(),
-            view_retention: std::env::var("GPUI_VIEW_RETENTION").map_or(true, |value| value != "0"),
+            view_retention: default_view_retention(),
             splice_keys: FxHashSet::default(),
             rendering_since: FxHashMap::default(),
         }
@@ -521,7 +544,8 @@ impl Window {
     /// Turning it off draws every view from scratch each frame, as upstream
     /// GPUI does. The `GPUI_VIEW_RETENTION=0` environment variable turns it
     /// off for every window.
-    #[cfg(any(test, feature = "test-support"))]
+    ///
+    /// Ghostex: public, so the host's setting can switch it without a restart.
     pub fn set_view_retention(&mut self, enabled: bool) {
         if self.retained_state.view_retention != enabled {
             self.retained_state.view_retention = enabled;
@@ -531,7 +555,6 @@ impl Window {
 
     /// Whether views are drawn again from what they drew on the last frame.
     /// See [`Window::set_view_retention`].
-    #[cfg(any(test, feature = "test-support"))]
     pub fn view_retention(&self) -> bool {
         self.retained_state.view_retention
     }

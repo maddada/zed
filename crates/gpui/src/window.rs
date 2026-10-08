@@ -3166,9 +3166,16 @@ impl Window {
 
     /// Ghostex: marks this window as a frosted surface. Its blurred background is then limited to
     /// the regions its elements report each frame through [`Window::report_frosted_region`].
+    ///
+    /// A frosted window draws every frame from scratch (no view retention): the regions are
+    /// reported while painting, so a view drawn again from the last frame would not report its
+    /// own. Frosted windows are small menus and tooltip bubbles, so this costs nothing.
     pub fn set_frosted_surface(&mut self, frosted: bool) {
         self.frosted_surface = frosted;
         self.applied_frosted_regions = None;
+        if frosted {
+            self.retained_state.view_retention = false;
+        }
         self.refresh();
     }
 
