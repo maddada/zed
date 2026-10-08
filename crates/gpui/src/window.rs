@@ -21,8 +21,8 @@ use crate::{
     TaffyLayoutEngine, Task, TextInputConfiguration, TextInputStateChange, TextRenderingMode,
     TextStyle, TextStyleRefinement, ThermalState, TransformationMatrix, Underline, UnderlineStyle,
     WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControls, WindowDecorations,
-    WindowOptions, WindowParams, WindowTextSystem, WindowVisibility, div, point, prelude::*, px, rems,
-    size, transparent_black,
+    WindowOptions, WindowParams, WindowTextSystem, WindowVisibility, div, point, prelude::*, px,
+    rems, size, transparent_black,
 };
 
 use crate::gestures::{GestureTuning, RecognizedTouchGesture, TouchGestureRecognizer};
