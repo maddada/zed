@@ -288,6 +288,8 @@ impl PrepaintStateIndex {
         PrepaintStateIndex {
             hitboxes_index: self.hitboxes_index - from.hitboxes_index + to.hitboxes_index,
             tooltips_index: self.tooltips_index - from.tooltips_index + to.tooltips_index,
+            native_occlusions_index: self.native_occlusions_index - from.native_occlusions_index
+                + to.native_occlusions_index,
             deferred_draws_index: self.deferred_draws_index - from.deferred_draws_index
                 + to.deferred_draws_index,
             dispatch_tree_index: self.dispatch_tree_index - from.dispatch_tree_index
@@ -309,6 +311,7 @@ impl PartialEq for PrepaintStateIndex {
         let PrepaintStateIndex {
             hitboxes_index,
             tooltips_index,
+            native_occlusions_index,
             deferred_draws_index,
             dispatch_tree_index,
             accessed_element_states_index,
@@ -316,6 +319,7 @@ impl PartialEq for PrepaintStateIndex {
         } = self;
         *hitboxes_index == other.hitboxes_index
             && *tooltips_index == other.tooltips_index
+            && *native_occlusions_index == other.native_occlusions_index
             && *deferred_draws_index == other.deferred_draws_index
             && *dispatch_tree_index == other.dispatch_tree_index
             && *accessed_element_states_index == other.accessed_element_states_index

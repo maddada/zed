@@ -7523,6 +7523,7 @@ dependencies = [
  "gpui_util",
  "gpui_wgpu",
  "http_client",
+ "image",
  "libc",
  "log",
  "notify-rust",
@@ -7530,6 +7531,7 @@ dependencies = [
  "open",
  "parking_lot",
  "raw-window-handle",
+ "serde_json",
  "smallvec",
  "smol",
  "strum 0.28.0",
@@ -7571,7 +7573,9 @@ dependencies = [
  "gpui_util",
  "image",
  "itertools 0.14.0",
+ "libc",
  "log",
+ "metal",
  "objc",
  "objc2 0.6.3",
  "objc2-app-kit 0.3.2",
@@ -7650,6 +7654,7 @@ dependencies = [
 name = "gpui_web"
 version = "0.1.0"
 dependencies = [
+ "accesskit",
  "anyhow",
  "console_error_panic_hook",
  "futures 0.3.34",

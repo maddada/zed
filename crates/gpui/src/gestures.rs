@@ -585,7 +585,7 @@ impl TouchGestureRecognizer {
         &mut self,
         event: &TouchEvent,
     ) -> SmallVec<[RecognizedTouchGesture; 2]> {
-        self.handle_event_at(event, Instant::now())
+        self.handle_event_at(event, event.timestamp.unwrap_or_else(Instant::now))
     }
 
     fn handle_event_at(
@@ -2206,6 +2206,7 @@ mod tests {
             position: point(px(x), px(y)),
             predicted_position: None,
             force: None,
+            timestamp: None,
         }
     }
 }

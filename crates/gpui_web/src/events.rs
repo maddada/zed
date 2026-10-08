@@ -166,6 +166,8 @@ impl WebWindowInner {
             self.register_composition_end(),
             self.register_focus(),
             self.register_blur(),
+            self.register_input_focus(),
+            self.register_input_blur(),
             self.register_pointer_enter(),
         ];
         handles.extend(self.register_selection_change());
@@ -274,6 +276,7 @@ impl WebWindowInner {
                     position,
                     predicted_position: None,
                     force: None,
+                    timestamp: None,
                 }));
                 // Keyboard and IME focus intentionally do not change here:
                 // whether this touch is a tap or a pan is only known at
@@ -347,6 +350,7 @@ impl WebWindowInner {
                     position,
                     predicted_position: None,
                     force: None,
+                    timestamp: None,
                 }));
 
                 // A keyboard opening or closing mid-gesture reflows the
@@ -459,6 +463,7 @@ impl WebWindowInner {
                     position: pointer_position_in_element(&event),
                     predicted_position: None,
                     force: None,
+                    timestamp: None,
                 }));
             } else {
                 this.pressed_button.set(None);
@@ -588,6 +593,7 @@ impl WebWindowInner {
                     position,
                     predicted_position: predicted_pointer_position(&event, position),
                     force: None,
+                    timestamp: None,
                 }));
                 return;
             }
@@ -1198,6 +1204,50 @@ impl WebWindowInner {
                 this.refresh_active_status();
             },
         )
+    }
+
+    /// This window's text input gaining focus means its canvas took the page's keyboard: an
+    /// overlay window opening with focus, or a click back into the window under it.
+    fn register_input_focus(self: &Rc<Self>) -> EventListenerHandle {
+        let this = Rc::clone(self);
+        self.listen_input("focus", move |_event: JsValue| {
+            if this.suppress_focus_status_events.get() {
+                return;
+            }
+            this.state.borrow_mut().holds_page_keyboard = true;
+            this.refresh_active_status();
+        })
+    }
+
+    /// Only another element of the page taking the focus (another window's input, as when an
+    /// overlay window opens or the user clicks back into the window under it) gives up the
+    /// keyboard. Focus leaving the page is the browser window's blur, and a dismissed software
+    /// keyboard blurs the input without a new target; neither deactivates this window here.
+    fn register_input_blur(self: &Rc<Self>) -> EventListenerHandle {
+        let this = Rc::clone(self);
+        self.listen_input("blur", move |event: JsValue| {
+            if this.suppress_focus_status_events.get() {
+                return;
+            }
+            let Some(target) = js_sys::Reflect::get(&event, &"relatedTarget".into())
+                .ok()
+                .and_then(|target| target.dyn_into::<web_sys::Element>().ok())
+            else {
+                return;
+            };
+            // Focus moving onto the accessibility mirror (a driver focusing a mirrored text
+            // field, which replays its keys and text on this input) keeps the window active.
+            if target
+                .closest("[data-gpui-a11y-root]")
+                .ok()
+                .flatten()
+                .is_some()
+            {
+                return;
+            }
+            this.state.borrow_mut().holds_page_keyboard = false;
+            this.refresh_active_status();
+        })
     }
 
     fn register_pointer_enter(self: &Rc<Self>) -> EventListenerHandle {

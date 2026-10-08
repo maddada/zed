@@ -2,7 +2,7 @@ use crate::{
     BoolExt, MacDisplay, NSRange, NSStringExt, TISCopyCurrentKeyboardInputSource,
     TISGetInputSourceProperty, WindowFrameSource, events::platform_input_from_native,
     kTISPropertyInputSourceIsASCIICapable, kTISPropertyInputSourceType, kTISTypeKeyboardInputMode,
-    ns_string, renderer,
+    ns_string, renderer, window_live, window_video, window_wallpaper,
 };
 #[cfg(any(test, feature = "test-support"))]
 use anyhow::Result;
@@ -11,8 +11,8 @@ use cocoa::{
     appkit::{
         NSApplication, NSBackingStoreBuffered, NSColor, NSEvent, NSEventModifierFlags, NSEventType,
         NSFilenamesPboardType, NSPasteboard, NSRequestUserAttentionType, NSScreen, NSView,
-        NSViewHeightSizable, NSViewWidthSizable, NSVisualEffectMaterial, NSVisualEffectState,
-        NSVisualEffectView, NSWindow, NSWindowCollectionBehavior, NSWindowOcclusionState,
+        NSViewHeightSizable, NSViewWidthSizable, NSVisualEffectBlendingMode, NSVisualEffectMaterial,
+        NSVisualEffectState, NSVisualEffectView, NSWindow, NSWindowCollectionBehavior, NSWindowOcclusionState,
         NSWindowOrderingMode, NSWindowStyleMask, NSWindowTitleVisibility,
     },
     base::{id, nil},
@@ -228,6 +228,14 @@ unsafe fn build_classes() {
                 set_frame_size as extern "C" fn(&Object, Sel, NSSize),
             );
             decl.add_method(
+                sel!(ghostexSetContentSizeHeld:),
+                set_content_size_held as extern "C" fn(&Object, Sel, BOOL),
+            );
+            decl.add_method(
+                sel!(ghostexSetContentSizeHeldFromLeft:),
+                set_content_size_held_from_left as extern "C" fn(&Object, Sel, BOOL),
+            );
+            decl.add_method(
                 sel!(displayLayer:),
                 display_layer as extern "C" fn(&Object, Sel, id),
             );
@@ -299,6 +307,9 @@ unsafe fn build_classes() {
         crate::fast::composition::build_overlay_view_class();
         BLURRED_VIEW_CLASS = {
             let mut decl = ClassDecl::new("BlurredView", class!(NSVisualEffectView)).unwrap();
+            decl.add_ivar::<id>(BLURRED_VIEW_REGION_MASK_IVAR);
+            decl.add_ivar::<f64>(BLURRED_VIEW_RADIUS_IVAR);
+            decl.add_ivar::<BOOL>(BLURRED_VIEW_KEEP_SATURATION_IVAR);
             decl.add_method(
                 sel!(initWithFrame:),
                 blurred_view_init_with_frame as extern "C" fn(&Object, Sel, NSRect) -> id,
@@ -306,6 +317,10 @@ unsafe fn build_classes() {
             decl.add_method(
                 sel!(updateLayer),
                 blurred_view_update_layer as extern "C" fn(&Object, Sel),
+            );
+            decl.add_method(
+                sel!(hitTest:),
+                blurred_view_hit_test as extern "C" fn(&Object, Sel, NSPoint) -> id,
             );
             decl.register()
         };
@@ -663,6 +678,44 @@ pub(crate) struct MacWindowState {
     pub(crate) native_view: NonNull<Object>,
     pub(crate) fast_composition: crate::fast::composition::MacComposition,
     blurred_view: Option<id>,
+    /// The blurred desktop picture shown instead of `blurred_view` in wallpaper mode.
+    wallpaper_view: Option<id>,
+    /// The screen frame `wallpaper_view`'s picture belongs to.
+    wallpaper_screen_frame: NSRect,
+    background_wallpaper: bool,
+    /// The picture the wallpaper backdrop shows in place of the desktop picture.
+    background_wallpaper_image: Option<std::path::PathBuf>,
+    /// Whether the wallpaper picture stays still against the screen while the window moves, rather
+    /// than covering the window and moving with it.
+    background_wallpaper_follows_screen: bool,
+    /// The rectangle, in window coordinates, a picture attached to the window covers instead of
+    /// the window itself.
+    background_wallpaper_cover: Option<NSRect>,
+    /// The looping video the wallpaper backdrop plays in place of its picture.
+    background_video: Option<std::path::PathBuf>,
+    /// Pause the video while the computer runs on battery.
+    background_video_only_on_power: bool,
+    /// The playing video, shown instead of `wallpaper_view` when a video is set.
+    video_view: Option<id>,
+    /// The animated style the wallpaper backdrop draws in place of its picture and video.
+    background_live: Option<gpui::LiveBackground>,
+    /// The drawing live style, shown instead of `video_view` and `wallpaper_view` when one is set.
+    live_view: Option<id>,
+    background_corner_radius: f64,
+    /// The blur radius in points of the live blur, the picture and the video (0: none;
+    /// `BLURRED_VIEW_BLUR_RADIUS` until set) and whether the live blur keeps its saturation
+    /// (`set_background_blur_style`).
+    background_blur_style: (f64, bool),
+    /// The content size GPUI keeps laying out at while an embedder animates the window's frame
+    /// (`ghostexSetContentSizeHeld:`). The drawable keeps this size and is shown pinned to the
+    /// view's right edge, so a window that grows or shrinks from its left edge slides its content
+    /// instead of re-rendering it at every intermediate width.
+    held_content_size: Option<Size<Pixels>>,
+    /// The held content is pinned to the view's left edge instead (`ghostexSetContentSizeHeldFromLeft:`),
+    /// for a window that grows or shrinks from its right edge.
+    held_content_pinned_left: bool,
+    /// Rounded rectangles the blurred background is limited to; empty blurs the whole window.
+    background_blur_region: Vec<(NSRect, f64)>,
     background_appearance: WindowBackgroundAppearance,
     cursor_style: CursorStyle,
     cursor_visible: Arc<AtomicBool>,
@@ -933,6 +986,9 @@ impl MacWindowState {
     }
 
     pub(crate) fn content_size(&self) -> Size<Pixels> {
+        if let Some(held) = self.held_content_size {
+            return held;
+        }
         let NSSize { width, height, .. } =
             unsafe { NSView::frame(self.native_window.contentView()) }.size;
         size(px(width as f32), px(height as f32))
@@ -1099,6 +1155,22 @@ impl MacWindow {
                     renderer_context.clone(),
                 ),
                 blurred_view: None,
+                wallpaper_view: None,
+                wallpaper_screen_frame: NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(0.0, 0.0)),
+                background_wallpaper: false,
+                background_wallpaper_image: None,
+                background_wallpaper_follows_screen: false,
+                background_wallpaper_cover: None,
+                background_video: None,
+                background_video_only_on_power: true,
+                video_view: None,
+                background_live: None,
+                live_view: None,
+                background_corner_radius: 0.0,
+                background_blur_style: (BLURRED_VIEW_BLUR_RADIUS, false),
+                held_content_size: None,
+                held_content_pinned_left: false,
+                background_blur_region: Vec::new(),
                 background_appearance: WindowBackgroundAppearance::Opaque,
                 cursor_style: CursorStyle::Arrow,
                 cursor_visible,
@@ -1393,6 +1465,12 @@ impl Drop for MacWindow {
         let window = this.native_window;
         let sheet_parent = this.sheet_parent.take();
         this.frame_source.take();
+        if let Some(view) = this.video_view.take() {
+            unsafe { window_video::remove_view(view) };
+        }
+        if let Some(view) = this.live_view.take() {
+            unsafe { window_live::remove_view(view) };
+        }
         unsafe {
             this.native_window.setDelegate_(nil);
         }
@@ -1880,27 +1958,169 @@ impl PlatformWindow for MacWindow {
             };
             this.native_window.setBackgroundColor_(background_color);
 
-            if background_appearance != WindowBackgroundAppearance::Blurred {
-                if let Some(blur_view) = this.blurred_view {
-                    NSView::removeFromSuperview(blur_view);
-                    this.blurred_view = None;
-                }
-            } else if this.blurred_view.is_none() {
-                let content_view = this.native_window.contentView();
-                let frame = NSView::bounds(content_view);
-                let mut blur_view: id = msg_send![BLURRED_VIEW_CLASS, alloc];
-                blur_view = NSView::initWithFrame_(blur_view, frame);
-                blur_view.setAutoresizingMask_(NSViewWidthSizable | NSViewHeightSizable);
+            apply_window_backdrop(&mut this);
+        }
+    }
 
-                let _: () = msg_send![
-                    content_view,
-                    addSubview: blur_view
-                    positioned: NSWindowOrderingMode::NSWindowBelow
-                    relativeTo: nil
-                ];
-                this.blurred_view = Some(blur_view.autorelease());
+    fn set_background_blur_style(&self, radius: Pixels, keep_saturation: bool) {
+        let mut this = self.0.as_ref().lock();
+        let style = (f64::from(f32::from(radius)).max(0.0), keep_saturation);
+        if this.background_blur_style == style {
+            return;
+        }
+        this.background_blur_style = style;
+        if let Some(blur_view) = this.blurred_view {
+            unsafe { apply_background_blur_style(blur_view, style) };
+        }
+        if let Some(video_view) = this.video_view {
+            unsafe { window_video::set_blur_radius(video_view, style.0) };
+            layout_window_wallpaper(&this);
+        }
+        if this.wallpaper_view.is_some() {
+            // The picture is blurred once per radius; show the one for the new radius.
+            unsafe { apply_window_backdrop(&mut this) };
+        }
+    }
+
+    fn set_background_corner_radius(&self, radius: Pixels) {
+        let mut this = self.0.as_ref().lock();
+        this.background_corner_radius = f64::from(f32::from(radius));
+        if let Some(blur_view) = this.blurred_view {
+            unsafe { apply_background_corner_radius(blur_view, this.background_corner_radius) };
+        }
+        if let Some(wallpaper_view) = this.wallpaper_view {
+            unsafe {
+                window_wallpaper::set_corner_radius(wallpaper_view, this.background_corner_radius)
+            };
+        }
+        if let Some(video_view) = this.video_view {
+            unsafe {
+                window_wallpaper::set_corner_radius(video_view, this.background_corner_radius)
+            };
+        }
+        if let Some(live_view) = this.live_view {
+            unsafe {
+                window_wallpaper::set_corner_radius(live_view, this.background_corner_radius)
+            };
+        }
+    }
+
+    fn set_background_blur_region(&self, region: Vec<(Bounds<Pixels>, Pixels)>) {
+        let mut this = self.0.as_ref().lock();
+        let region = region
+            .into_iter()
+            .map(|(bounds, radius)| {
+                (
+                    NSRect::new(
+                        NSPoint::new(
+                            f64::from(f32::from(bounds.origin.x)),
+                            f64::from(f32::from(bounds.origin.y)),
+                        ),
+                        NSSize::new(
+                            f64::from(f32::from(bounds.size.width)),
+                            f64::from(f32::from(bounds.size.height)),
+                        ),
+                    ),
+                    f64::from(f32::from(radius)),
+                )
+            })
+            .collect();
+        this.background_blur_region = region;
+        if let Some(blur_view) = this.blurred_view {
+            unsafe { apply_background_blur_region(blur_view, &this.background_blur_region) };
+        }
+    }
+
+    fn set_background_wallpaper(&self, wallpaper: bool) {
+        let mut this = self.0.as_ref().lock();
+        if this.background_wallpaper == wallpaper {
+            return;
+        }
+        this.background_wallpaper = wallpaper;
+        unsafe { apply_window_backdrop(&mut this) };
+    }
+
+    fn set_background_wallpaper_image(&self, image: Option<std::path::PathBuf>) {
+        let mut this = self.0.as_ref().lock();
+        if this.background_wallpaper_image == image {
+            return;
+        }
+        this.background_wallpaper_image = image;
+        if this.background_wallpaper {
+            unsafe { apply_window_backdrop(&mut this) };
+        }
+    }
+
+    fn set_background_video(&self, video: Option<std::path::PathBuf>, only_on_power: bool) {
+        let mut this = self.0.as_ref().lock();
+        if this.background_video_only_on_power != only_on_power {
+            this.background_video_only_on_power = only_on_power;
+            if let Some(view) = this.video_view {
+                unsafe { window_video::set_only_on_power(view, only_on_power) };
             }
         }
+        if this.background_video == video {
+            return;
+        }
+        this.background_video = video;
+        if this.background_wallpaper {
+            unsafe { apply_window_backdrop(&mut this) };
+        }
+    }
+
+    fn set_background_live(&self, live: Option<gpui::LiveBackground>) {
+        let mut this = self.0.as_ref().lock();
+        if this.background_live == live {
+            return;
+        }
+        let updated_in_place = match (&this.background_live, &live, this.live_view) {
+            (Some(_), Some(live), Some(view)) => unsafe { window_live::update(view, live.clone()) },
+            _ => false,
+        };
+        this.background_live = live;
+        if !updated_in_place && this.background_wallpaper {
+            unsafe { apply_window_backdrop(&mut this) };
+        }
+    }
+
+    fn set_background_wallpaper_follows_screen(&self, follows_screen: bool) {
+        let mut this = self.0.as_ref().lock();
+        if this.background_wallpaper_follows_screen == follows_screen {
+            return;
+        }
+        this.background_wallpaper_follows_screen = follows_screen;
+        layout_window_wallpaper(&this);
+    }
+
+    fn set_background_wallpaper_cover(&self, cover: Option<Bounds<Pixels>>) {
+        let mut this = self.0.as_ref().lock();
+        let cover = cover.map(|cover| {
+            NSRect::new(
+                NSPoint::new(
+                    f64::from(f32::from(cover.origin.x)),
+                    f64::from(f32::from(cover.origin.y)),
+                ),
+                NSSize::new(
+                    f64::from(f32::from(cover.size.width)),
+                    f64::from(f32::from(cover.size.height)),
+                ),
+            )
+        });
+        let unchanged = match (this.background_wallpaper_cover, cover) {
+            (None, None) => true,
+            (Some(a), Some(b)) => {
+                a.origin.x == b.origin.x
+                    && a.origin.y == b.origin.y
+                    && a.size.width == b.size.width
+                    && a.size.height == b.size.height
+            }
+            _ => false,
+        };
+        if unchanged {
+            return;
+        }
+        this.background_wallpaper_cover = cover;
+        layout_window_wallpaper(&this);
     }
 
     fn background_appearance(&self) -> WindowBackgroundAppearance {
@@ -2056,7 +2276,7 @@ impl PlatformWindow for MacWindow {
         self.0.as_ref().lock().close_callback = Some(callback);
     }
 
-    fn on_hit_test_window_control(&self, _callback: Box<dyn FnMut() -> Option<WindowControlArea>>) {
+    fn on_hit_test_window_control(&self, _callback: Box<dyn FnMut(gpui::Point<gpui::Pixels>) -> Option<WindowControlArea>>) {
     }
 
     fn on_appearance_changed(&self, callback: Box<dyn FnMut()>) {
@@ -2117,6 +2337,10 @@ impl PlatformWindow for MacWindow {
 
     fn on_toggle_tab_bar(&self, callback: Box<dyn FnMut()>) {
         self.0.as_ref().lock().toggle_tab_bar_callback = Some(callback);
+    }
+
+    fn supports_shader_effects(&self) -> bool {
+        true
     }
 
     fn draw(&self, scene: &gpui::Scene) {
@@ -2579,10 +2803,29 @@ extern "C" fn reset_cursor_rects(this: &Object, _: Sel) {
             CursorStyle::DragLink => msg_send![class!(NSCursor), dragLinkCursor],
             CursorStyle::DragCopy => msg_send![class!(NSCursor), dragCopyCursor],
             CursorStyle::ContextualMenu => msg_send![class!(NSCursor), contextualMenuCursor],
+
+            // Public class methods since macOS 15, private ones before it; a system with neither
+            // keeps the arrow rather than raising an unrecognized selector.
+            CursorStyle::ZoomIn => zoom_cursor(sel!(zoomInCursor), sel!(_zoomInCursor)),
+            CursorStyle::ZoomOut => zoom_cursor(sel!(zoomOutCursor), sel!(_zoomOutCursor)),
         };
 
         let bounds = NSView::bounds(this as *const Object as id);
         let _: () = msg_send![this, addCursorRect: bounds cursor: cursor];
+    }
+}
+
+/// One of `NSCursor`'s zoom cursors, or the arrow on a system whose AppKit has neither.
+unsafe fn zoom_cursor(public: Sel, private: Sel) -> id {
+    unsafe {
+        let class = class!(NSCursor);
+        for selector in [public, private] {
+            let responds: BOOL = msg_send![class, respondsToSelector: selector];
+            if responds == YES {
+                return msg_send![class, performSelector: selector];
+            }
+        }
+        msg_send![class, arrowCursor]
     }
 }
 
@@ -2824,6 +3067,27 @@ pub(crate) extern "C" fn handle_view_event(this: &Object, _: Sel, native_event: 
     let event = unsafe { platform_input_from_native(native_event, Some(window_height)) };
 
     if let Some(mut event) = event {
+        // While the content size is held the content is drawn pinned to the view's right edge, so
+        // a pointer position in the narrower view maps that far to the right in GPUI's layout.
+        if let Some(held) = lock
+            .held_content_size
+            .filter(|_| !lock.held_content_pinned_left)
+        {
+            let live_width = unsafe { NSView::frame(lock.native_window.contentView()) }
+                .size
+                .width;
+            let dx = held.width - px(live_width as f32);
+            match &mut event {
+                PlatformInput::MouseDown(event) => event.position.x += dx,
+                PlatformInput::MouseUp(event) => event.position.x += dx,
+                PlatformInput::MouseMove(event) => event.position.x += dx,
+                PlatformInput::MousePressure(event) => event.position.x += dx,
+                PlatformInput::MouseExited(event) => event.position.x += dx,
+                PlatformInput::ScrollWheel(event) => event.position.x += dx,
+                PlatformInput::Pinch(event) => event.position.x += dx,
+                _ => {}
+            }
+        }
         // AppKit unhides the cursor on the next mouse movement; mirror that here.
         if matches!(
             event,
@@ -3007,6 +3271,253 @@ fn report_visibility(window_state: &Arc<Mutex<MacWindowState>>) {
         .detach();
 }
 
+/// Puts the backdrop a blurred window asked for behind its content: the blurred desktop picture in
+/// wallpaper mode when the screen's picture can be read, the live behind-window blur otherwise, and
+/// nothing for an opaque window. `NSVisualEffectView` manages the live effect layer directly, which
+/// downsamples the backdrop and gives more control over the effect layer.
+unsafe fn apply_window_backdrop(this: &mut MacWindowState) {
+    unsafe {
+        let blurred = this.background_appearance == WindowBackgroundAppearance::Blurred;
+        let content_view = this.native_window.contentView();
+        if blurred && this.background_wallpaper && apply_live_backdrop(this, content_view) {
+            return;
+        }
+        if let Some(view) = this.live_view.take() {
+            retire_backdrop_view(view, window_live::remove_view);
+        }
+        if blurred && this.background_wallpaper && apply_video_backdrop(this, content_view) {
+            return;
+        }
+        if let Some(view) = this.video_view.take() {
+            retire_backdrop_view(view, window_video::remove_view);
+        }
+        let wallpaper = if blurred && this.background_wallpaper {
+            window_wallpaper::wallpaper_for_window(
+                this.native_window,
+                this.background_wallpaper_image.as_deref(),
+                this.background_blur_style.0,
+            )
+        } else {
+            None
+        };
+        if let Some(wallpaper) = wallpaper {
+            if let Some(blur_view) = this.blurred_view.take() {
+                NSView::removeFromSuperview(blur_view);
+            }
+            let view = match this.wallpaper_view {
+                Some(view) => view,
+                None => {
+                    let view = window_wallpaper::create_view(content_view);
+                    window_wallpaper::set_corner_radius(view, this.background_corner_radius);
+                    this.wallpaper_view = Some(view);
+                    view
+                }
+            };
+            this.wallpaper_screen_frame = wallpaper.screen_frame;
+            window_wallpaper::show(
+                view,
+                &wallpaper,
+                this.native_window,
+                this.background_wallpaper_follows_screen,
+                this.background_wallpaper_cover,
+            );
+            return;
+        }
+        if let Some(view) = this.wallpaper_view.take() {
+            window_wallpaper::remove_view(view);
+        }
+        if !blurred {
+            if let Some(blur_view) = this.blurred_view.take() {
+                NSView::removeFromSuperview(blur_view);
+            }
+        } else if this.blurred_view.is_none() {
+            let frame = NSView::bounds(content_view);
+            let mut blur_view: id = msg_send![BLURRED_VIEW_CLASS, alloc];
+            blur_view = NSView::initWithFrame_(blur_view, frame);
+            blur_view.setAutoresizingMask_(NSViewWidthSizable | NSViewHeightSizable);
+
+            let _: () = msg_send![
+                content_view,
+                addSubview: blur_view
+                positioned: NSWindowOrderingMode::NSWindowBelow
+                relativeTo: nil
+            ];
+            apply_background_corner_radius(blur_view, this.background_corner_radius);
+            apply_background_blur_region(blur_view, &this.background_blur_region);
+            apply_background_blur_style(blur_view, this.background_blur_style);
+            this.blurred_view = Some(blur_view.autorelease());
+        }
+    }
+}
+
+/// Shows the backdrop's video when one is set and its file exists, replacing the picture and the
+/// live blur. Returns whether it did; a missing file leaves the other backdrops to take over.
+unsafe fn apply_video_backdrop(this: &mut MacWindowState, content_view: id) -> bool {
+    unsafe {
+        let Some(path) = this.background_video.clone() else {
+            return false;
+        };
+        let screen: id = msg_send![this.native_window, screen];
+        if screen == nil || !path.is_file() {
+            return false;
+        }
+        let current = this
+            .video_view
+            .and_then(|view| window_video::view_path(view));
+        if current.as_deref() != path.to_str() {
+            if let Some(view) = this.video_view.take() {
+                retire_backdrop_view(view, window_video::remove_view);
+            }
+            let Some(view) =
+                window_video::create_view(
+                    content_view,
+                    &path,
+                    this.background_video_only_on_power,
+                    this.background_blur_style.0,
+                )
+            else {
+                return false;
+            };
+            window_wallpaper::set_corner_radius(view, this.background_corner_radius);
+            this.video_view = Some(view);
+        }
+        if let Some(blur_view) = this.blurred_view.take() {
+            NSView::removeFromSuperview(blur_view);
+        }
+        if let Some(view) = this.wallpaper_view.take() {
+            window_wallpaper::remove_view(view);
+        }
+        this.wallpaper_screen_frame = msg_send![screen, frame];
+        layout_window_wallpaper(this);
+        true
+    }
+}
+
+/// Shows the backdrop's live style when one is set and this platform draws it, replacing the video,
+/// the picture and the live blur. Returns whether it did; an unknown style leaves the other
+/// backdrops to take over.
+unsafe fn apply_live_backdrop(this: &mut MacWindowState, content_view: id) -> bool {
+    unsafe {
+        let Some(live) = this.background_live.clone() else {
+            return false;
+        };
+        if !window_live::draws_style(&live.style) {
+            return false;
+        }
+        match this.live_view {
+            Some(view) => {
+                if !window_live::update(view, live) {
+                    return false;
+                }
+            }
+            None => {
+                let Some(view) = window_live::create_view(content_view, live) else {
+                    return false;
+                };
+                window_wallpaper::set_corner_radius(view, this.background_corner_radius);
+                this.live_view = Some(view);
+            }
+        }
+        if let Some(view) = this.video_view.take() {
+            retire_backdrop_view(view, window_video::remove_view);
+        }
+        if let Some(blur_view) = this.blurred_view.take() {
+            NSView::removeFromSuperview(blur_view);
+        }
+        if let Some(view) = this.wallpaper_view.take() {
+            window_wallpaper::remove_view(view);
+        }
+        layout_window_wallpaper(this);
+        true
+    }
+}
+
+/// How long an animation and a video, or two videos, cross-fade when the backdrop swaps between
+/// them; the same length as a live style's own cross-fade (`window_live::LIVE_FADE`).
+const BACKDROP_SWAP_FADE: std::time::Duration = std::time::Duration::from_millis(750);
+
+/// Takes an animation or video backdrop off screen without a jump.
+///
+/// CDXC:Theming 2026-09-26 WHY:
+/// The user's rule for the moving glass is that it never jumps, and Live now holds both the app's animations and the user's own video. A new backdrop view is always added underneath the one on screen, so the old one fades out on top of it and is removed once the fade is over, which cross-fades an animation into a video, a video into an animation, or one video into another. Under Reduce Motion it is removed at once.
+unsafe fn retire_backdrop_view(view: id, remove: unsafe fn(id)) {
+    unsafe {
+        if window_video::reduce_motion() {
+            remove(view);
+            return;
+        }
+        let _: id = msg_send![view, retain];
+        let layer: id = msg_send![view, layer];
+        if layer != nil {
+            let fade: id = msg_send![
+                class!(CABasicAnimation),
+                animationWithKeyPath: ns_string("opacity")
+            ];
+            let from: id = msg_send![class!(NSNumber), numberWithFloat: 1.0f32];
+            let to: id = msg_send![class!(NSNumber), numberWithFloat: 0.0f32];
+            let _: () = msg_send![fade, setFromValue: from];
+            let _: () = msg_send![fade, setToValue: to];
+            let _: () = msg_send![fade, setDuration: BACKDROP_SWAP_FADE.as_secs_f64()];
+            let _: () = msg_send![layer, setOpacity: 0.0f32];
+            let _: () = msg_send![layer, addAnimation: fade forKey: ns_string("gpuiBackdropSwap")];
+        }
+        let view = view as usize;
+        let when = dispatch2::DispatchTime::NOW.time(BACKDROP_SWAP_FADE.as_nanos() as i64);
+        let _ = DispatchQueue::main().after(when, move || {
+            let view = view as id;
+            remove(view);
+            let _: () = msg_send![view, release];
+        });
+    }
+}
+
+/// Re-reads the desktop picture behind a wallpaper-mode window: it changed screens, Spaces, or the
+/// picture itself may have changed.
+pub(crate) unsafe fn refresh_window_backdrop(window: &Object) {
+    unsafe {
+        let window_state = get_window_state(window);
+        let mut lock = window_state.as_ref().lock();
+        if lock.background_wallpaper
+            && lock.background_appearance == WindowBackgroundAppearance::Blurred
+        {
+            apply_window_backdrop(&mut lock);
+        }
+    }
+}
+
+fn layout_window_wallpaper(lock: &MacWindowState) {
+    if let Some(view) = lock.live_view {
+        // A picture attached to the window and covering another window's rectangle is how a window
+        // laid over the main one lines up with it; the live style follows the same rectangle.
+        let cover = (!lock.background_wallpaper_follows_screen)
+            .then_some(lock.background_wallpaper_cover)
+            .flatten();
+        unsafe { window_live::set_cover(view, cover) };
+    }
+    if let Some(view) = lock.video_view {
+        unsafe {
+            window_video::layout(
+                view,
+                lock.native_window,
+                lock.wallpaper_screen_frame,
+                lock.background_wallpaper_follows_screen,
+                lock.background_wallpaper_cover,
+            )
+        };
+    }
+    if let Some(view) = lock.wallpaper_view {
+        unsafe {
+            window_wallpaper::layout(
+                view,
+                lock.native_window,
+                lock.wallpaper_screen_frame,
+                lock.background_wallpaper_follows_screen,
+                lock.background_wallpaper_cover,
+            )
+        };
+    }
+}
+
 extern "C" fn window_did_change_occlusion_state(this: &Object, _: Sel, _: id) {
     let window_state = unsafe { get_window_state(this) };
     let mut lock = window_state.lock();
@@ -3030,7 +3541,9 @@ extern "C" fn window_did_change_occlusion_state(this: &Object, _: Sel, _: id) {
 
 extern "C" fn window_did_resize(this: &Object, _: Sel, _: id) {
     let window_state = unsafe { get_window_state(this) };
-    window_state.as_ref().lock().move_traffic_light();
+    let mut lock = window_state.as_ref().lock();
+    lock.move_traffic_light();
+    layout_window_wallpaper(&lock);
 }
 
 extern "C" fn window_will_enter_fullscreen(this: &Object, _: Sel, _: id) {
@@ -3102,6 +3615,11 @@ fn ns_error_description(error: id) -> String {
 extern "C" fn window_did_move(this: &Object, _: Sel, _: id) {
     let window_state = unsafe { get_window_state(this) };
     let mut lock = window_state.as_ref().lock();
+    // A picture attached to the window moves with it for free; only one held against the screen
+    // has to be shifted back.
+    if lock.background_wallpaper_follows_screen {
+        layout_window_wallpaper(&lock);
+    }
     if let Some(mut callback) = lock.moved_callback.take() {
         drop(lock);
         callback();
@@ -3142,6 +3660,7 @@ extern "C" fn window_did_change_screen(this: &Object, _: Sel, _: id) {
     lock.start_display_link();
     drop(lock);
     update_window_scale_factor(&window_state);
+    unsafe { refresh_window_backdrop(this) };
 }
 
 extern "C" fn window_did_change_key_status(this: &Object, selector: Sel, _: id) {
@@ -3303,6 +3822,9 @@ extern "C" fn set_frame_size(this: &Object, _: Sel, size: NSSize) {
     unsafe {
         let _: () = msg_send![super(this, class!(NSView)), setFrameSize: size];
     }
+    if lock.held_content_size.is_some() {
+        return;
+    }
 
     let scale_factor = lock.scale_factor();
     let drawable_size = new_size.to_device_pixels(scale_factor);
@@ -3316,6 +3838,56 @@ extern "C" fn set_frame_size(this: &Object, _: Sel, size: NSSize) {
         callback(content_size, scale_factor);
         window_state.lock().resize_callback = Some(callback);
     };
+}
+
+/// Holds (or releases) the size GPUI lays out at while the embedder animates the window's frame.
+/// Releasing it catches GPUI up with whatever size the view ended at.
+extern "C" fn set_content_size_held(this: &Object, _: Sel, held: BOOL) {
+    hold_content_size(this, held, false);
+}
+
+/// `ghostexSetContentSizeHeld:` for a window that slides in from the right: the held content is
+/// pinned to the view's left edge, which also leaves pointer positions as they are.
+extern "C" fn set_content_size_held_from_left(this: &Object, _: Sel, held: BOOL) {
+    hold_content_size(this, held, true);
+}
+
+fn hold_content_size(this: &Object, held: BOOL, pinned_left: bool) {
+    let window_state = unsafe { get_window_state(this) };
+    let mut lock = window_state.as_ref().lock();
+    let layer = lock.renderer.layer_ptr() as id;
+    if held == YES {
+        if lock.held_content_size.is_none() {
+            let NSSize { width, height, .. } =
+                unsafe { NSView::frame(lock.native_window.contentView()) }.size;
+            lock.held_content_size = Some(size(px(width as f32), px(height as f32)));
+            lock.held_content_pinned_left = pinned_left;
+            let gravity = if pinned_left { "left" } else { "right" };
+            unsafe {
+                let _: () = msg_send![layer, setContentsGravity: ns_string(gravity)];
+            }
+        }
+        return;
+    }
+    lock.held_content_pinned_left = false;
+    let Some(held) = lock.held_content_size.take() else {
+        return;
+    };
+    unsafe {
+        let _: () = msg_send![layer, setContentsGravity: ns_string("resize")];
+    }
+    let content_size = lock.content_size();
+    if content_size == held {
+        return;
+    }
+    let scale_factor = lock.scale_factor();
+    lock.renderer
+        .update_drawable_size(content_size.to_device_pixels(scale_factor));
+    if let Some(mut callback) = lock.resize_callback.take() {
+        drop(lock);
+        callback(content_size, scale_factor);
+        window_state.lock().resize_callback = Some(callback);
+    }
 }
 
 extern "C" fn display_layer(this: &Object, _: Sel, _: id) {
@@ -3803,12 +4375,23 @@ fn display_id_for_screen(screen: id) -> Option<CGDirectDisplayID> {
     }
 }
 
+/// Ghostex: the blur is a backdrop the content view hosts, never a target of its own. Hit by a
+/// click it would stand in for the content view, and in a window that is not key AppKit asks the
+/// hit view whether the first click may pass (`acceptsFirstMouse:`); the effect view says no, so
+/// the first click on a non-activating blurred popup (a frosted menu) was swallowed.
+extern "C" fn blurred_view_hit_test(_: &Object, _: Sel, _: NSPoint) -> id {
+    nil
+}
+
 extern "C" fn blurred_view_init_with_frame(this: &Object, _: Sel, frame: NSRect) -> id {
     unsafe {
         let view = msg_send![super(this, class!(NSVisualEffectView)), initWithFrame: frame];
         // Use a colorless semantic material. The default value `AppearanceBased`, though not
-        // manually set, is deprecated.
-        NSVisualEffectView::setMaterial_(view, NSVisualEffectMaterial::Selection);
+        // manually set, is deprecated. `Selection` stopped producing a backdrop layer on
+        // macOS 26, which left blurred windows merely transparent; `UnderWindowBackground` is the
+        // material meant for the area behind a window's own content and still produces one.
+        NSVisualEffectView::setMaterial_(view, NSVisualEffectMaterial::UnderWindowBackground);
+        NSVisualEffectView::setBlendingMode_(view, NSVisualEffectBlendingMode::BehindWindow);
         NSVisualEffectView::setState_(view, NSVisualEffectState::Active);
         view
     }
@@ -3819,12 +4402,140 @@ extern "C" fn blurred_view_update_layer(this: &Object, _: Sel) {
         let _: () = msg_send![super(this, class!(NSVisualEffectView)), updateLayer];
         let layer: id = msg_send![this, layer];
         if !layer.is_null() {
-            remove_layer_background(layer);
+            let radius: f64 = *this.get_ivar(BLURRED_VIEW_RADIUS_IVAR);
+            let keep_saturation: BOOL = *this.get_ivar(BLURRED_VIEW_KEEP_SATURATION_IVAR);
+            remove_layer_background(layer, radius, keep_saturation == YES);
+            // Window snapshots (Mission Control, the app switcher's previews) drop backdrop
+            // layers, so with every background stripped the window would show there as nothing
+            // at all. The live blur covers this base everywhere else.
+            let black: id = msg_send![class!(NSColor), blackColor];
+            let black: id = msg_send![black, CGColor];
+            let _: () = msg_send![layer, setBackgroundColor: black];
+            // AppKit may rebuild the layer's state here; keep the blur region's mask on it.
+            let mask: id = *this.get_ivar(BLURRED_VIEW_REGION_MASK_IVAR);
+            if !mask.is_null() {
+                let current: id = msg_send![layer, mask];
+                if current != mask {
+                    let _: () = msg_send![layer, setMask: mask];
+                }
+            }
         }
     }
 }
 
-unsafe fn remove_layer_background(layer: id) {
+unsafe fn apply_background_corner_radius(blur_view: id, radius: f64) {
+    unsafe {
+        let _: () = msg_send![blur_view, setWantsLayer: YES];
+        let layer: id = msg_send![blur_view, layer];
+        if layer.is_null() {
+            return;
+        }
+        let _: () = msg_send![layer, setCornerRadius: radius];
+        let _: () = msg_send![layer, setMasksToBounds: if radius > 0.0 { YES } else { NO }];
+    }
+}
+
+/// Holds the `CAShapeLayer` that masks a `BlurredView` to its blur region, or nil.
+const BLURRED_VIEW_REGION_MASK_IVAR: &str = "ghostexRegionMask";
+
+/// A `BlurredView`'s own blur radius in points (0: none).
+const BLURRED_VIEW_RADIUS_IVAR: &str = "ghostexBlurRadius";
+
+/// Whether a `BlurredView` keeps the material's saturation filter.
+const BLURRED_VIEW_KEEP_SATURATION_IVAR: &str = "ghostexKeepSaturation";
+
+/// Stores the blur style on the view and has AppKit rebuild its layer, which applies it
+/// (`blurred_view_update_layer`).
+unsafe fn apply_background_blur_style(blur_view: id, (radius, keep_saturation): (f64, bool)) {
+    unsafe {
+        let object = &mut *(blur_view as *mut Object);
+        object.set_ivar::<f64>(BLURRED_VIEW_RADIUS_IVAR, radius);
+        object.set_ivar::<BOOL>(
+            BLURRED_VIEW_KEEP_SATURATION_IVAR,
+            if keep_saturation { YES } else { NO },
+        );
+        let _: () = msg_send![blur_view, setNeedsDisplay: YES];
+    }
+}
+
+/// Masks the blurred view to rounded rectangles given in the window's top-left coordinates, so a
+/// window holding several separate cards blurs only behind the cards and not the gaps between
+/// them.
+///
+/// CDXC:Theming 2026-09-23 WHY:
+/// The mask is a shape layer on the view's own layer, not `NSVisualEffectView.maskImage`: the mask
+/// image clips only the material's backdrop, and left the black snapshot base this view paints on
+/// its layer covering the whole window, so frosted toasts sat in a black box.
+unsafe fn apply_background_blur_region(blur_view: id, region: &[(NSRect, f64)]) {
+    unsafe {
+        let _: () = msg_send![blur_view, setWantsLayer: YES];
+        let layer: id = msg_send![blur_view, layer];
+        let object = &mut *(blur_view as *mut Object);
+        let previous: id = *object.get_ivar(BLURRED_VIEW_REGION_MASK_IVAR);
+        if region.is_empty() {
+            if !previous.is_null() {
+                if !layer.is_null() {
+                    let _: () = msg_send![layer, setMask: nil];
+                }
+                let _: () = msg_send![previous, release];
+                object.set_ivar::<id>(BLURRED_VIEW_REGION_MASK_IVAR, nil);
+            }
+            return;
+        }
+        let bounds = NSView::bounds(blur_view);
+        let height = bounds.size.height;
+        let cg_path = CGPathCreateMutable();
+        for (rect, radius) in region {
+            // The region is top-down; the layer's own space runs bottom-up.
+            let flipped = NSRect::new(
+                NSPoint::new(rect.origin.x, height - rect.origin.y - rect.size.height),
+                rect.size,
+            );
+            // Core Graphics rejects a corner radius over half the rectangle's shorter side.
+            let radius = radius
+                .min(rect.size.width / 2.0)
+                .min(rect.size.height / 2.0)
+                .max(0.0);
+            CGPathAddRoundedRect(cg_path, ptr::null(), flipped, radius, radius);
+        }
+        let mask: id = if previous.is_null() {
+            let mask: id = msg_send![class!(CAShapeLayer), layer];
+            let _: id = msg_send![mask, retain];
+            object.set_ivar::<id>(BLURRED_VIEW_REGION_MASK_IVAR, mask);
+            mask
+        } else {
+            previous
+        };
+        let _: () = msg_send![class!(CATransaction), begin];
+        let _: () = msg_send![class!(CATransaction), setDisableActions: YES];
+        let _: () = msg_send![mask, setFrame: bounds];
+        let _: () = msg_send![mask, setPath: cg_path];
+        if !layer.is_null() {
+            let _: () = msg_send![layer, setMask: mask];
+        }
+        let _: () = msg_send![class!(CATransaction), commit];
+        CGPathRelease(cg_path);
+    }
+}
+
+unsafe extern "C" {
+    fn CGPathCreateMutable() -> *mut c_void;
+    fn CGPathAddRoundedRect(
+        path: *mut c_void,
+        transform: *const c_void,
+        rect: NSRect,
+        corner_width: f64,
+        corner_height: f64,
+    );
+    fn CGPathRelease(path: *mut c_void);
+}
+
+/// The blur of a window that never calls `set_background_blur_style`. The material's own blur is
+/// tuned for thin sidebars; under a tinted app surface a wider blur keeps desktop detail from
+/// reading through as noise.
+const BLURRED_VIEW_BLUR_RADIUS: f64 = 60.0;
+
+unsafe fn remove_layer_background(layer: id, blur_radius: f64, keep_saturation: bool) {
     unsafe {
         let _: () = msg_send![layer, setBackgroundColor:nil];
 
@@ -3837,6 +4548,20 @@ unsafe fn remove_layer_background(layer: id) {
 
         let filters: id = msg_send![layer, filters];
         if !filters.is_null() {
+            let blur_string: id = ns_string("Blur");
+            let count = NSArray::count(filters);
+            for i in 0..count {
+                let filter = filters.objectAtIndex(i);
+                let description: id = msg_send![filter, description];
+                let hit: BOOL = msg_send![description, containsString: blur_string];
+                if hit == YES {
+                    let radius: id = msg_send![class!(NSNumber), numberWithDouble: blur_radius];
+                    let _: () =
+                        msg_send![filter, setValue: radius forKey: ns_string("inputRadius")];
+                    let _: () = msg_send![layer, setFilters: filters];
+                    break;
+                }
+            }
             // Remove the increased saturation.
             // The effect of a `CAFilter` or `CIFilter` is determined by its name, and the
             // `description` reflects its name and some parameters. Currently `NSVisualEffectView`
@@ -3847,7 +4572,7 @@ unsafe fn remove_layer_background(layer: id) {
             for i in 0..count {
                 let description: id = msg_send![filters.objectAtIndex(i), description];
                 let hit: BOOL = msg_send![description, containsString: test_string];
-                if hit == NO {
+                if hit == NO || keep_saturation {
                     continue;
                 }
 
@@ -3869,7 +4594,7 @@ unsafe fn remove_layer_background(layer: id) {
             let count = NSArray::count(sublayers);
             for i in 0..count {
                 let sublayer = sublayers.objectAtIndex(i);
-                remove_layer_background(sublayer);
+                remove_layer_background(sublayer, blur_radius, keep_saturation);
             }
         }
     }
