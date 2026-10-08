@@ -11,6 +11,7 @@ mod directx_renderer;
 mod dispatcher;
 mod display;
 mod events;
+mod fast;
 mod keyboard;
 mod platform;
 mod system_notifications;
