@@ -255,11 +255,13 @@ pub fn set_default_view_retention(enabled: bool) {
     );
 }
 
+/// Ghostex: off unless the host turns it on (or `GPUI_VIEW_RETENTION=1`), so every entry point
+/// draws as upstream GPUI does until its setting says otherwise.
 fn default_view_retention() -> bool {
     match DEFAULT_VIEW_RETENTION.load(std::sync::atomic::Ordering::Relaxed) {
         1 => false,
         2 => true,
-        _ => std::env::var("GPUI_VIEW_RETENTION").map_or(true, |value| value != "0"),
+        _ => std::env::var("GPUI_VIEW_RETENTION").is_ok_and(|value| value != "0"),
     }
 }
 
