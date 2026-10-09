@@ -993,9 +993,20 @@ impl PlatformWindow for WindowsWindow {
         match background_appearance {
             WindowBackgroundAppearance::Opaque => {
                 set_window_composition_attribute(hwnd, None, 0);
+                // DWMSBT_NONE: drops a system acrylic a blurred window had.
+                dwm_set_window_composition_attribute(hwnd, 1);
             }
             WindowBackgroundAppearance::Transparent => {
                 set_window_composition_attribute(hwnd, None, 2);
+                dwm_set_window_composition_attribute(hwnd, 1);
+            }
+            // Ghostex: the system acrylic (DWMSBT_TRANSIENTWINDOW) where Windows has it. The
+            // legacy acrylic accent made Windows recompose the window's blur slowly on every
+            // frame it drew: a 4K window at 240 Hz drew a sidebar slide at ~25 ms a frame with
+            // it, ~10 ms opaque or over a drawn wallpaper.
+            WindowBackgroundAppearance::Blurred if system_backdrop_available() => {
+                set_window_composition_attribute(hwnd, None, 0);
+                dwm_set_window_composition_attribute(hwnd, 3);
             }
             WindowBackgroundAppearance::Blurred => {
                 set_window_composition_attribute(hwnd, Some((0, 0, 0, 0)), 4);
@@ -1801,6 +1812,13 @@ fn retrieve_window_placement(
     let bounds = bounds.to_device_pixels(display.scale_factor());
     placement.rcNormalPosition = calculate_window_rect(bounds, border_offset);
     Ok(placement)
+}
+
+/// Whether DWMWA_SYSTEMBACKDROP_TYPE is available (Windows 11 22H2, build 22621, or later).
+fn system_backdrop_available() -> bool {
+    let mut version = unsafe { std::mem::zeroed() };
+    let status = unsafe { windows::Wdk::System::SystemServices::RtlGetVersion(&mut version) };
+    status.is_ok() && version.dwBuildNumber >= 22621
 }
 
 fn dwm_set_window_composition_attribute(hwnd: HWND, backdrop_type: u32) {
