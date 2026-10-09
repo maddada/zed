@@ -1000,16 +1000,18 @@ impl PlatformWindow for WindowsWindow {
                 set_window_composition_attribute(hwnd, None, 2);
                 dwm_set_window_composition_attribute(hwnd, 1);
             }
-            // Ghostex: the system acrylic (DWMSBT_TRANSIENTWINDOW) where Windows has it. The
-            // legacy acrylic accent made Windows recompose the window's blur slowly on every
-            // frame it drew: a 4K window at 240 Hz drew a sidebar slide at ~25 ms a frame with
-            // it, ~10 ms opaque or over a drawn wallpaper.
-            WindowBackgroundAppearance::Blurred if system_backdrop_available() => {
-                set_window_composition_attribute(hwnd, None, 0);
-                dwm_set_window_composition_attribute(hwnd, 3);
-            }
+            // Ghostex: a frosted surface's blur is drawn by its blur windows, so the surface
+            // itself stays clear; any other blurred window blurs its whole rectangle.
             WindowBackgroundAppearance::Blurred => {
-                set_window_composition_attribute(hwnd, Some((0, 0, 0, 0)), 4);
+                if self
+                    .state
+                    .frosted_backdrops
+                    .set(hwnd, None, true, self.state.scale_factor.get())
+                {
+                    clear_window_blur(hwnd);
+                } else {
+                    set_whole_window_blur(hwnd);
+                }
             }
             WindowBackgroundAppearance::MicaBackdrop => {
                 // DWMSBT_MAINWINDOW => MicaBase
@@ -1020,14 +1022,11 @@ impl PlatformWindow for WindowsWindow {
                 dwm_set_window_composition_attribute(hwnd, 4);
             }
         }
-        // Ghostex: a frosted surface's blur is drawn by its blur windows; its own accent stays clear.
-        if self.state.frosted_backdrops.set(
-            hwnd,
-            None,
-            background_appearance == WindowBackgroundAppearance::Blurred,
-            self.state.scale_factor.get(),
-        ) {
-            set_window_composition_attribute(hwnd, None, 2);
+        // Ghostex: leaving Blurred takes a frosted surface's blur windows away.
+        if background_appearance != WindowBackgroundAppearance::Blurred {
+            self.state
+                .frosted_backdrops
+                .set(hwnd, None, false, self.state.scale_factor.get());
         }
         self.update_backdrop(|request| {
             request.blurred = background_appearance == WindowBackgroundAppearance::Blurred;
@@ -1078,9 +1077,9 @@ impl PlatformWindow for WindowsWindow {
                     .frosted_backdrops
                     .set(hwnd, Some(region.clone()), true, scale);
             if backdrops {
-                set_window_composition_attribute(hwnd, None, 2);
+                clear_window_blur(hwnd);
             } else {
-                set_window_composition_attribute(hwnd, Some((0, 0, 0, 0)), 4);
+                set_whole_window_blur(hwnd);
             }
         } else {
             self.state
@@ -1812,6 +1811,28 @@ fn retrieve_window_placement(
     let bounds = bounds.to_device_pixels(display.scale_factor());
     placement.rcNormalPosition = calculate_window_rect(bounds, border_offset);
     Ok(placement)
+}
+
+/// Ghostex: blurs the window's whole rectangle with the system acrylic (DWMSBT_TRANSIENTWINDOW)
+/// where Windows has it, else with the legacy acrylic accent. The legacy accent made Windows
+/// recompose the window's blur slowly on every frame it drew: a 4K window at 240 Hz drew a
+/// sidebar slide at ~25 ms a frame with it, ~10 ms opaque or over a drawn wallpaper.
+fn set_whole_window_blur(hwnd: HWND) {
+    if system_backdrop_available() {
+        set_window_composition_attribute(hwnd, None, 0);
+        dwm_set_window_composition_attribute(hwnd, 3);
+    } else {
+        set_window_composition_attribute(hwnd, Some((0, 0, 0, 0)), 4);
+    }
+}
+
+/// Ghostex: no blur of the window's own: a frosted surface whose rounded blur windows draw its
+/// blur (`frosted_backdrop.rs`). DWM draws a window's acrylic, accent or system backdrop, over its
+/// whole rectangle whatever its region, so either one left on shows a square blur behind the
+/// surface's rounded cards.
+fn clear_window_blur(hwnd: HWND) {
+    set_window_composition_attribute(hwnd, None, 2);
+    dwm_set_window_composition_attribute(hwnd, 1);
 }
 
 /// Whether DWMWA_SYSTEMBACKDROP_TYPE is available (Windows 11 22H2, build 22621, or later).
