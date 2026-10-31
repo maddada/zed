@@ -237,8 +237,21 @@ pub struct TextSystem {
     wrapper_pool: Mutex<FxHashMap<FontIdWithSize, Vec<LineWrapper>>>,
     pub(crate) fallback_font_stack: SmallVec<[Font; 2]>,
     font_generation: Arc<AtomicUsize>,
+    font_family_substitution: RwLock<Option<FontFamilySubstitution>>,
     missing_glyph_reporter: Arc<MissingGlyphReporter>,
     missing_glyph_receiver: Mutex<Option<MissingGlyphReceiver>>,
+}
+
+/// Prefixed to a family name, asks for exactly that family whatever
+/// [`TextSystem::set_font_family_substitution`] is set to.
+pub const EXACT_FONT_FAMILY_PREFIX: char = '\u{1}';
+
+/// Ghostex: an application-wide font choice. Every text run, measurement and
+/// inherited default asking for one of `from` draws in `to` instead, without
+/// each call site having to know about the choice.
+struct FontFamilySubstitution {
+    from: FxHashSet<SharedString>,
+    to: SharedString,
 }
 
 #[derive(Clone)]
@@ -273,6 +286,7 @@ impl TextSystem {
                 font("Arial"), // macOS, Windows
             ],
             font_generation: Arc::default(),
+            font_family_substitution: RwLock::default(),
             missing_glyph_reporter: Arc::new(MissingGlyphReporter {
                 generation: missing_glyph_generation.clone(),
                 sender,
@@ -306,6 +320,48 @@ impl TextSystem {
         self.missing_glyph_reporter.reset();
         self.font_generation.fetch_add(1, Ordering::Release);
         Ok(())
+    }
+
+    /// Draws every font asking for one of `from` in the family `to` instead, or
+    /// stops substituting when `to` is `None`. A family `to` that is not
+    /// installed leaves each font on the family it asked for.
+    ///
+    /// Cached font resolution and line layouts are invalidated, the same as
+    /// [`Self::add_fonts`]; call `App::refresh_windows` to redraw with it.
+    pub fn set_font_family_substitution(
+        &self,
+        from: impl IntoIterator<Item = SharedString>,
+        to: Option<SharedString>,
+    ) {
+        *self.font_family_substitution.write() = to.map(|to| FontFamilySubstitution {
+            from: from.into_iter().collect(),
+            to,
+        });
+        crate::fast::text::fonts_changed();
+        self.font_ids_by_font.write().clear();
+        self.font_generation.fetch_add(1, Ordering::Release);
+    }
+
+    /// How many times the installed fonts or the family substitution have
+    /// changed: when this moves, text may measure differently.
+    pub(crate) fn font_generation(&self) -> usize {
+        self.font_generation.load(Ordering::Acquire)
+    }
+
+    /// The font `font` draws in when that is not simply `font` itself.
+    fn substituted_font(&self, font: &Font) -> Option<Font> {
+        if let Some(family) = font.family.strip_prefix(EXACT_FONT_FAMILY_PREFIX) {
+            return Some(Font {
+                family: family.to_string().into(),
+                ..font.clone()
+            });
+        }
+        let substitution = self.font_family_substitution.read();
+        let substitution = substitution.as_ref()?;
+        substitution.from.contains(&font.family).then(|| Font {
+            family: substitution.to.clone(),
+            ..font.clone()
+        })
     }
 
     /// Takes the receiver for missing-glyph reports.
@@ -352,12 +408,28 @@ impl TextSystem {
     /// Panics if the font and none of the fallbacks can be resolved.
     pub fn resolve_font(&self, font: &Font) -> FontId {
         crate::fast::text::remembered_font(self, font, || {
-            if let Some(CachedFont::Direct(font_id) | CachedFont::Fallback(font_id)) =
-                self.font_ids_by_font.read().get(font)
+            // The substitution comes before the font's own cache entry: a family can be cached
+            // from being tried as another font's fallback.
+            let substituted = self.substituted_font(font);
             {
-                return *font_id;
+                let font_ids = self.font_ids_by_font.read();
+                if let Some(CachedFont::Direct(font_id)) = substituted
+                    .as_ref()
+                    .and_then(|substituted| font_ids.get(substituted))
+                {
+                    return *font_id;
+                }
+                let target_is_known = substituted
+                    .as_ref()
+                    .is_none_or(|substituted| font_ids.contains_key(substituted));
+                if target_is_known
+                    && let Some(CachedFont::Direct(font_id) | CachedFont::Fallback(font_id)) =
+                        font_ids.get(font)
+                {
+                    return *font_id;
+                }
             }
-            self.resolve_font_uncached(font)
+            self.resolve_font_uncached(font, substituted)
         })
     }
 
@@ -570,12 +642,13 @@ impl TextSystem {
             .recommended_rendering_mode(font_id, font_size)
     }
 
-    fn resolve_font_uncached(&self, font: &Font) -> FontId {
+    fn resolve_font_uncached(&self, font: &Font, substituted: Option<Font>) -> FontId {
         let mut font_error = None;
         let font_id = {
             let mut font_ids = self.font_ids_by_font.upgradable_read();
-            if let Some(CachedFont::Direct(font_id) | CachedFont::Fallback(font_id)) =
-                font_ids.get(font)
+            if substituted.is_none()
+                && let Some(CachedFont::Direct(font_id) | CachedFont::Fallback(font_id)) =
+                    font_ids.get(font)
             {
                 return *font_id;
             }
@@ -605,7 +678,9 @@ impl TextSystem {
                 }
             };
 
-            if let Some(font_id) = lookup_font(font) {
+            if let Some(font_id) = substituted.as_ref().and_then(&mut lookup_font) {
+                Some(font_id)
+            } else if let Some(font_id) = lookup_font(font) {
                 Some(font_id)
             } else {
                 let font_id =
@@ -1324,6 +1399,69 @@ mod font_resolution_tests {
 
         text_system.fallback_font_stack.clear();
         assert_eq!(text_system.resolve_font(&requested), FontId(42));
+    }
+
+    fn with_fonts() -> TextSystem {
+        TextSystem::new(Arc::new(NoopTextSystem::new()))
+    }
+
+    fn cached(text_system: &TextSystem, installed: &[(&str, usize)]) {
+        let mut font_ids = text_system.font_ids_by_font.write();
+        for (family, id) in installed {
+            font_ids.insert(font(family.to_string()), CachedFont::Direct(FontId(*id)));
+        }
+    }
+
+    #[test]
+    fn substitutes_the_named_families_and_leaves_the_others() {
+        let installed = [("Inter", 1), ("JetBrains Mono", 2), ("Georgia", 3)];
+        let text_system = with_fonts();
+        text_system.set_font_family_substitution(["Inter".into()], Some("Georgia".into()));
+        cached(&text_system, &installed);
+
+        assert_eq!(text_system.resolve_font(&font("Inter")), FontId(3));
+        assert_eq!(text_system.resolve_font(&font("JetBrains Mono")), FontId(2));
+    }
+
+    #[test]
+    fn a_family_that_is_not_installed_keeps_the_font_asked_for() {
+        let installed = [("Inter", 1)];
+        let text_system = with_fonts();
+        text_system.set_font_family_substitution(["Inter".into()], Some("Gone".into()));
+        cached(&text_system, &installed);
+        let missing = CachedFont::Missing(Arc::new(anyhow::anyhow!("missing font")));
+        text_system
+            .font_ids_by_font
+            .write()
+            .insert(font("Gone"), missing);
+
+        assert_eq!(text_system.resolve_font(&font("Inter")), FontId(1));
+    }
+
+    #[test]
+    fn an_exact_family_skips_the_substitution() {
+        let installed = [("Inter", 1), ("Georgia", 3)];
+        let text_system = with_fonts();
+        text_system.set_font_family_substitution(["Inter".into()], Some("Georgia".into()));
+        cached(&text_system, &installed);
+        let exact = format!("{EXACT_FONT_FAMILY_PREFIX}Inter");
+
+        assert_eq!(text_system.resolve_font(&font(exact)), FontId(1));
+    }
+
+    #[test]
+    fn clearing_the_substitution_restores_the_family_and_moves_the_generation() {
+        let installed = [("Inter", 1), ("Georgia", 3)];
+        let text_system = with_fonts();
+        let before = text_system.font_generation();
+        text_system.set_font_family_substitution(["Inter".into()], Some("Georgia".into()));
+        cached(&text_system, &installed);
+        assert_eq!(text_system.resolve_font(&font("Inter")), FontId(3));
+        assert_ne!(text_system.font_generation(), before);
+
+        text_system.set_font_family_substitution([], None);
+        cached(&text_system, &installed);
+        assert_eq!(text_system.resolve_font(&font("Inter")), FontId(1));
     }
 }
 

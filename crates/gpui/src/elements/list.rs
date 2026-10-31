@@ -77,6 +77,8 @@ pub(crate) struct StateInner {
     pub(crate) version: crate::fast::dependencies::StateVersion,
     /// The items the last layout measured; see [`ListState::last_measured_range`].
     last_measured_range: Range<usize>,
+    /// Ghostex: the text system's font generation the items were measured with.
+    last_font_generation: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -331,6 +333,7 @@ impl ListState {
             follow_state: FollowState::default(),
             version: crate::fast::dependencies::StateVersion::default(),
             last_measured_range: 0..0,
+            last_font_generation: 0,
         })));
         state.splice(0..0, item_count);
         state
@@ -1666,11 +1669,14 @@ impl Element for List {
 
         let hitbox = window.insert_hitbox(bounds, HitboxBehavior::Normal);
 
-        // If the width of the list has changed, invalidate all cached item heights
-        if state
-            .last_layout_bounds
-            .is_none_or(|last_bounds| last_bounds.size.width != bounds.size.width)
+        // If the width of the list or its fonts have changed, invalidate all cached item heights
+        let font_generation = window.text_system().font_generation();
+        if state.last_font_generation != font_generation
+            || state
+                .last_layout_bounds
+                .is_none_or(|last_bounds| last_bounds.size.width != bounds.size.width)
         {
+            state.last_font_generation = font_generation;
             let new_items = SumTree::from_iter(
                 state.items.iter().map(|item| ListItem::Unmeasured {
                     size_hint: None,
