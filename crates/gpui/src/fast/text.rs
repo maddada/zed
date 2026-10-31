@@ -42,6 +42,10 @@ pub(crate) struct TextMeasureInputs {
     text_style: Rc<TextStyle>,
     font_size: Pixels,
     line_height: Pixels,
+    /// [`fonts_generation`] when these were taken. A family's name draws in another font after a
+    /// font is added or a substitution set, so a measurement from before that shaped something
+    /// else even though every input here reads the same.
+    fonts_generation: u64,
     /// The layout of the element whose inputs these are, or of a later one
     /// that took the measurement over while leaving the node with these.
     layout: RefCell<TextLayout>,
@@ -133,6 +137,7 @@ impl TextMeasureInputs {
         }
         let (style, other_style) = (&*self.text_style, &*other.text_style);
         if !(self.text == other.text
+            && self.fonts_generation == other.fonts_generation
             && self.font_size == other.font_size
             && self.line_height == other.line_height
             && style.white_space == other_style.white_space
@@ -229,6 +234,7 @@ fn measure_inputs(
         text_style,
         font_size,
         line_height,
+        fonts_generation: fonts_generation(),
         layout: RefCell::new(layout.clone()),
     }
 }
@@ -382,6 +388,7 @@ fn measure_text(
         font_size,
         line_height,
         layout,
+        fonts_generation: _,
     } = inputs;
     let layout = &*layout.borrow();
     let (font_size, line_height) = (*font_size, *line_height);
@@ -1143,6 +1150,7 @@ mod tests {
                 text_style,
                 font_size,
                 line_height,
+                fonts_generation: super::fonts_generation(),
                 layout: RefCell::new(TextLayout::default()),
             };
             let probe = |width| Size {

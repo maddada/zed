@@ -237,22 +237,14 @@ pub struct TextSystem {
     wrapper_pool: Mutex<FxHashMap<FontIdWithSize, Vec<LineWrapper>>>,
     pub(crate) fallback_font_stack: SmallVec<[Font; 2]>,
     font_generation: Arc<AtomicUsize>,
-    font_family_substitution: RwLock<Option<FontFamilySubstitution>>,
+    font_family_substitutions: RwLock<FxHashMap<SharedString, SharedString>>,
     missing_glyph_reporter: Arc<MissingGlyphReporter>,
     missing_glyph_receiver: Mutex<Option<MissingGlyphReceiver>>,
 }
 
 /// Prefixed to a family name, asks for exactly that family whatever
-/// [`TextSystem::set_font_family_substitution`] is set to.
+/// [`TextSystem::set_font_family_substitutions`] is set to.
 pub const EXACT_FONT_FAMILY_PREFIX: char = '\u{1}';
-
-/// Ghostex: an application-wide font choice. Every text run, measurement and
-/// inherited default asking for one of `from` draws in `to` instead, without
-/// each call site having to know about the choice.
-struct FontFamilySubstitution {
-    from: FxHashSet<SharedString>,
-    to: SharedString,
-}
 
 #[derive(Clone)]
 enum CachedFont {
@@ -286,7 +278,7 @@ impl TextSystem {
                 font("Arial"), // macOS, Windows
             ],
             font_generation: Arc::default(),
-            font_family_substitution: RwLock::default(),
+            font_family_substitutions: RwLock::default(),
             missing_glyph_reporter: Arc::new(MissingGlyphReporter {
                 generation: missing_glyph_generation.clone(),
                 sender,
@@ -309,6 +301,15 @@ impl TextSystem {
         names
     }
 
+    /// Ghostex: the families the platform itself reports as monospaced, without
+    /// loading them. Empty on a platform that does not say.
+    pub fn monospace_font_names(&self) -> Vec<String> {
+        let mut names = self.platform_text_system.monospace_font_names();
+        names.sort_unstable();
+        names.dedup();
+        names
+    }
+
     /// Add a font's data to the text system.
     ///
     /// Cached font resolution and line layouts are invalidated after installation.
@@ -322,21 +323,19 @@ impl TextSystem {
         Ok(())
     }
 
-    /// Draws every font asking for one of `from` in the family `to` instead, or
-    /// stops substituting when `to` is `None`. A family `to` that is not
+    /// Ghostex: application-wide font choices. Every text run, measurement and
+    /// inherited default asking for a family that is a key of `substitutions`
+    /// draws in that key's value instead, without each call site having to know
+    /// about the choice. An empty table stops substituting. A value that is not
     /// installed leaves each font on the family it asked for.
     ///
     /// Cached font resolution and line layouts are invalidated, the same as
     /// [`Self::add_fonts`]; call `App::refresh_windows` to redraw with it.
-    pub fn set_font_family_substitution(
+    pub fn set_font_family_substitutions(
         &self,
-        from: impl IntoIterator<Item = SharedString>,
-        to: Option<SharedString>,
+        substitutions: impl IntoIterator<Item = (SharedString, SharedString)>,
     ) {
-        *self.font_family_substitution.write() = to.map(|to| FontFamilySubstitution {
-            from: from.into_iter().collect(),
-            to,
-        });
+        *self.font_family_substitutions.write() = substitutions.into_iter().collect();
         crate::fast::text::fonts_changed();
         self.font_ids_by_font.write().clear();
         self.font_generation.fetch_add(1, Ordering::Release);
@@ -344,7 +343,7 @@ impl TextSystem {
 
     /// How many times the installed fonts or the family substitution have
     /// changed: when this moves, text may measure differently.
-    pub(crate) fn font_generation(&self) -> usize {
+    pub fn font_generation(&self) -> usize {
         self.font_generation.load(Ordering::Acquire)
     }
 
@@ -356,10 +355,9 @@ impl TextSystem {
                 ..font.clone()
             });
         }
-        let substitution = self.font_family_substitution.read();
-        let substitution = substitution.as_ref()?;
-        substitution.from.contains(&font.family).then(|| Font {
-            family: substitution.to.clone(),
+        let family = self.font_family_substitutions.read().get(&font.family)?.clone();
+        Some(Font {
+            family,
             ..font.clone()
         })
     }
@@ -1416,7 +1414,7 @@ mod font_resolution_tests {
     fn substitutes_the_named_families_and_leaves_the_others() {
         let installed = [("Inter", 1), ("JetBrains Mono", 2), ("Georgia", 3)];
         let text_system = with_fonts();
-        text_system.set_font_family_substitution(["Inter".into()], Some("Georgia".into()));
+        text_system.set_font_family_substitutions([("Inter".into(), "Georgia".into())]);
         cached(&text_system, &installed);
 
         assert_eq!(text_system.resolve_font(&font("Inter")), FontId(3));
@@ -1424,10 +1422,24 @@ mod font_resolution_tests {
     }
 
     #[test]
+    fn each_family_follows_its_own_substitution() {
+        let installed = [("Inter", 1), ("JetBrains Mono", 2), ("Georgia", 3), ("Menlo", 4)];
+        let text_system = with_fonts();
+        text_system.set_font_family_substitutions([
+            ("Inter".into(), "Georgia".into()),
+            ("JetBrains Mono".into(), "Menlo".into()),
+        ]);
+        cached(&text_system, &installed);
+
+        assert_eq!(text_system.resolve_font(&font("Inter")), FontId(3));
+        assert_eq!(text_system.resolve_font(&font("JetBrains Mono")), FontId(4));
+    }
+
+    #[test]
     fn a_family_that_is_not_installed_keeps_the_font_asked_for() {
         let installed = [("Inter", 1)];
         let text_system = with_fonts();
-        text_system.set_font_family_substitution(["Inter".into()], Some("Gone".into()));
+        text_system.set_font_family_substitutions([("Inter".into(), "Gone".into())]);
         cached(&text_system, &installed);
         let missing = CachedFont::Missing(Arc::new(anyhow::anyhow!("missing font")));
         text_system
@@ -1442,7 +1454,7 @@ mod font_resolution_tests {
     fn an_exact_family_skips_the_substitution() {
         let installed = [("Inter", 1), ("Georgia", 3)];
         let text_system = with_fonts();
-        text_system.set_font_family_substitution(["Inter".into()], Some("Georgia".into()));
+        text_system.set_font_family_substitutions([("Inter".into(), "Georgia".into())]);
         cached(&text_system, &installed);
         let exact = format!("{EXACT_FONT_FAMILY_PREFIX}Inter");
 
@@ -1454,12 +1466,12 @@ mod font_resolution_tests {
         let installed = [("Inter", 1), ("Georgia", 3)];
         let text_system = with_fonts();
         let before = text_system.font_generation();
-        text_system.set_font_family_substitution(["Inter".into()], Some("Georgia".into()));
+        text_system.set_font_family_substitutions([("Inter".into(), "Georgia".into())]);
         cached(&text_system, &installed);
         assert_eq!(text_system.resolve_font(&font("Inter")), FontId(3));
         assert_ne!(text_system.font_generation(), before);
 
-        text_system.set_font_family_substitution([], None);
+        text_system.set_font_family_substitutions([]);
         cached(&text_system, &installed);
         assert_eq!(text_system.resolve_font(&font("Inter")), FontId(1));
     }

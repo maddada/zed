@@ -102,43 +102,54 @@ impl Default for AppleTextSystem {
     }
 }
 
+/// Every installed face's descriptor. Reading a descriptor's attributes does not load its font.
+fn available_font_descriptors() -> Option<CFArray<CTFontDescriptor>> {
+    let collection = core_text::font_collection::create_for_all_families();
+    // NOTE: We intentionally avoid using `collection.get_descriptors()` here because
+    // it has a memory leak bug in core-text v21.0.0. The upstream code uses
+    // `wrap_under_get_rule` but `CTFontCollectionCreateMatchingFontDescriptors`
+    // follows the Create Rule (caller owns the result), so it should use
+    // `wrap_under_create_rule`. We call the function directly with correct memory management.
+    unsafe extern "C" {
+        fn CTFontCollectionCreateMatchingFontDescriptors(
+            collection: CTFontCollectionRef,
+        ) -> CFArrayRef;
+    }
+    unsafe {
+        let array_ref =
+            CTFontCollectionCreateMatchingFontDescriptors(collection.as_concrete_TypeRef());
+        if array_ref.is_null() {
+            None
+        } else {
+            Some(CFArray::wrap_under_create_rule(array_ref))
+        }
+    }
+}
+
 impl PlatformTextSystem for AppleTextSystem {
     fn add_fonts(&self, fonts: Vec<Cow<'static, [u8]>>) -> Result<()> {
         self.0.write().add_fonts(fonts)
     }
 
     fn all_font_names(&self) -> Vec<String> {
-        let mut names = Vec::new();
-        let collection = core_text::font_collection::create_for_all_families();
-        // NOTE: We intentionally avoid using `collection.get_descriptors()` here because
-        // it has a memory leak bug in core-text v21.0.0. The upstream code uses
-        // `wrap_under_get_rule` but `CTFontCollectionCreateMatchingFontDescriptors`
-        // follows the Create Rule (caller owns the result), so it should use
-        // `wrap_under_create_rule`. We call the function directly with correct memory management.
-        unsafe extern "C" {
-            fn CTFontCollectionCreateMatchingFontDescriptors(
-                collection: CTFontCollectionRef,
-            ) -> CFArrayRef;
-        }
-        let descriptors: Option<CFArray<CTFontDescriptor>> = unsafe {
-            let array_ref =
-                CTFontCollectionCreateMatchingFontDescriptors(collection.as_concrete_TypeRef());
-            if array_ref.is_null() {
-                None
-            } else {
-                Some(CFArray::wrap_under_create_rule(array_ref))
-            }
-        };
-        let Some(descriptors) = descriptors else {
-            return names;
-        };
-        for descriptor in descriptors.into_iter() {
-            names.extend(lenient_font_attributes::family_name(&descriptor));
-        }
+        let mut names: Vec<String> = available_font_descriptors()
+            .iter()
+            .flat_map(|descriptors| descriptors.iter())
+            .filter_map(|descriptor| lenient_font_attributes::family_name(&descriptor))
+            .collect();
         if let Ok(fonts_in_memory) = self.0.read().memory_source.all_families() {
             names.extend(fonts_in_memory);
         }
         names
+    }
+
+    fn monospace_font_names(&self) -> Vec<String> {
+        available_font_descriptors()
+            .iter()
+            .flat_map(|descriptors| descriptors.iter())
+            .filter(|descriptor| lenient_font_attributes::is_monospaced(descriptor))
+            .filter_map(|descriptor| lenient_font_attributes::family_name(&descriptor))
+            .collect()
     }
 
     fn font_id(&self, font: &Font) -> Result<FontId> {
@@ -744,14 +755,40 @@ fn fontkit_style(style: FontStyle) -> FontkitStyle {
 mod lenient_font_attributes {
     use core_foundation::{
         base::{CFRetain, CFType, TCFType},
+        dictionary::{CFDictionary, CFDictionaryRef},
+        number::{CFNumber, CFNumberRef},
         string::{CFString, CFStringRef},
     };
     use core_text::font_descriptor::{
         CTFontDescriptor, CTFontDescriptorCopyAttribute, kCTFontFamilyNameAttribute,
+        kCTFontMonoSpaceTrait, kCTFontSymbolicTrait, kCTFontTraitsAttribute,
     };
 
     pub fn family_name(descriptor: &CTFontDescriptor) -> Option<String> {
         unsafe { get_string_attribute(descriptor, kCTFontFamilyNameAttribute) }
+    }
+
+    /// Whether the face carries CoreText's monospace trait.
+    pub fn is_monospaced(descriptor: &CTFontDescriptor) -> bool {
+        unsafe {
+            let value = CTFontDescriptorCopyAttribute(
+                descriptor.as_concrete_TypeRef(),
+                kCTFontTraitsAttribute,
+            );
+            if value.is_null() {
+                return false;
+            }
+            let value = CFType::wrap_under_create_rule(value);
+            if !value.instance_of::<CFDictionary>() {
+                return false;
+            }
+            let traits: CFDictionary =
+                CFDictionary::wrap_under_get_rule(value.as_CFTypeRef() as CFDictionaryRef);
+            traits
+                .find(kCTFontSymbolicTrait as *const std::os::raw::c_void)
+                .and_then(|number| CFNumber::wrap_under_get_rule(*number as CFNumberRef).to_i64())
+                .is_some_and(|symbolic| symbolic as u32 & kCTFontMonoSpaceTrait != 0)
+        }
     }
 
     fn get_string_attribute(
@@ -785,6 +822,13 @@ mod tests {
     use crate::AppleTextSystem;
     use gpui::{FontFallbacks, FontFeatures, FontRun, GlyphId, PlatformTextSystem, font, px};
     use std::sync::Arc;
+
+    #[test]
+    fn the_platform_reports_monospaced_families_only() {
+        let names = AppleTextSystem::new().monospace_font_names();
+        assert!(names.iter().any(|name| name == "Menlo"), "{names:?}");
+        assert!(!names.iter().any(|name| name == "Helvetica"), "{names:?}");
+    }
 
     #[test]
     fn test_reload_family_with_features_and_fallbacks() {

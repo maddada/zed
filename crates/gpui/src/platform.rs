@@ -1590,6 +1590,11 @@ pub trait PlatformTextSystem: Send + Sync {
     fn set_missing_glyph_sink(&self, _sink: Option<Arc<dyn MissingGlyphSink>>) {}
     /// Get all available font names.
     fn all_font_names(&self) -> Vec<String>;
+    /// Ghostex: the available font names the platform reports as monospaced,
+    /// where it can say so without loading them.
+    fn monospace_font_names(&self) -> Vec<String> {
+        Vec::new()
+    }
     /// Get the font ID for a font descriptor.
     fn font_id(&self, descriptor: &Font) -> Result<FontId>;
     /// Prewarm any system font caches needed to shape text.
