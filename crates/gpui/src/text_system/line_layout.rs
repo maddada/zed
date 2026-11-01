@@ -240,6 +240,10 @@ impl LineLayout {
                 if ch != ' '
                     && first_non_whitespace_ix.is_some()
                     && crate::fast::line_break::allows_break_between(prev_ch, ch)
+                    && !crate::fast::line_break::question_mark_ends_word(
+                        ch,
+                        glyphs.peek().map(|(_, next, _)| *next),
+                    )
                 {
                     last_candidate_ix = Some(boundary);
                     last_candidate_x = x;

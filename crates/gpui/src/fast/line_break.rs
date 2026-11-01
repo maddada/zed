@@ -22,6 +22,22 @@ pub(crate) fn allows_break_between(prev: char, c: char) -> bool {
         && !(is_cjk(prev) && closes_cjk_text(c))
 }
 
+/// Whether `c`, followed by `next` (`None` at the end of the text), is a `?`
+/// that ends its word, which stays on the line of the word it ends:
+/// `picture?` never wraps as `picture` / `?`. A `?` inside a word, as in a
+/// URL's `foo?b=2`, is still a break, which is why the wrappers keep `?` out
+/// of the word characters and ask this with the character after it.
+pub(crate) fn question_mark_ends_word(c: char, next: Option<char>) -> bool {
+    c == '?'
+        && next.is_none_or(|next| {
+            next.is_whitespace()
+                || matches!(
+                    next,
+                    '?' | '!' | '.' | ',' | ')' | ']' | '}' | '"' | '”' | '’' | '\'' | '»' | '…'
+                )
+        })
+}
+
 /// ASCII punctuation that, written right after CJK text, closes it like its
 /// full-width form would (UAX #14 classes CL, CP, EX, IS and PO): `你好,世界`.
 /// After Latin text a break before it stays, since that is what lets a long

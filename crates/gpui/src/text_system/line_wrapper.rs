@@ -69,7 +69,7 @@ impl LineWrapper {
             .flat_map(move |fragment| fragment.wrap_boundary_candidates())
             .peekable();
         iter::from_fn(move || {
-            for candidate in candidates.by_ref() {
+            while let Some(candidate) = candidates.next() {
                 let ix = index;
                 index += candidate.len_utf8();
                 let mut new_prev_c = prev_c;
@@ -89,6 +89,18 @@ impl LineWrapper {
                             if c != ' '
                                 && first_non_whitespace_ix.is_some()
                                 && crate::fast::line_break::allows_break_between(fast_prev_char, c)
+                                && !crate::fast::line_break::question_mark_ends_word(
+                                    c,
+                                    match candidates.peek() {
+                                        Some(WrapBoundaryCandidate::Char { character }) => {
+                                            Some(*character)
+                                        }
+                                        Some(WrapBoundaryCandidate::Element { .. }) => {
+                                            Some('\u{FFFC}')
+                                        }
+                                        None => None,
+                                    },
+                                )
                             {
                                 last_candidate_ix = ix;
                                 last_candidate_width = width;
@@ -404,7 +416,8 @@ impl LineWrapper {
         let mut indent: Option<u32> = None;
         let mut truncate_ix = 0usize;
 
-        for (ix, c) in text.char_indices() {
+        let mut chars = text.char_indices().peekable();
+        while let Some((ix, c)) = chars.next() {
             if c == '\n' {
                 if line >= max_lines - 1 && !text[ix + 1..].trim().is_empty() {
                     // Newline on the last allowed line with real content
@@ -445,6 +458,10 @@ impl LineWrapper {
             } else if c != ' '
                 && first_non_whitespace_ix.is_some()
                 && crate::fast::line_break::allows_break_between(prev_c, c)
+                && !crate::fast::line_break::question_mark_ends_word(
+                    c,
+                    chars.peek().map(|(_, next)| *next),
+                )
             {
                 last_candidate_ix = ix;
                 last_candidate_width = width;
