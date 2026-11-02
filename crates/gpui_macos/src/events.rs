@@ -351,6 +351,7 @@ fn parse_keystroke(native_event: &NSEvent) -> Keystroke {
     let alt = modifiers.contains(NSEventModifierFlags::Option);
     let mut shift = modifiers.contains(NSEventModifierFlags::Shift);
     let command = modifiers.contains(NSEventModifierFlags::Command);
+    let caps_lock = modifiers.contains(NSEventModifierFlags::CapsLock);
     let function = modifiers.contains(NSEventModifierFlags::Function)
         && first_char
             .is_none_or(|ch| !(NSUpArrowFunctionKey..=NSModeSwitchFunctionKey).contains(&ch));
@@ -455,15 +456,10 @@ fn parse_keystroke(native_event: &NSEvent) -> Keystroke {
             }
 
             if !control && !command && !function {
-                let mut mods = NO_MOD;
-                if shift {
-                    mods |= SHIFT_MOD;
-                }
-                if alt {
-                    mods |= OPTION_MOD;
-                }
-
-                key_char = Some(chars_for_modified_key(native_event.keyCode(), mods));
+                key_char = Some(chars_for_modified_key(
+                    native_event.keyCode(),
+                    key_char_layout_modifiers(shift, alt, caps_lock),
+                ));
             }
 
             if shift
@@ -505,7 +501,28 @@ fn always_use_command_layout() -> bool {
 const NO_MOD: u32 = 0;
 const CMD_MOD: u32 = 1;
 const SHIFT_MOD: u32 = 2;
+const ALPHA_LOCK_MOD: u32 = 4;
 const OPTION_MOD: u32 = 8;
+
+/// UCKeyTranslate modifier state for `key_char`, the text the key types.
+/// Caps Lock (Carbon's alphaLock) is part of it so the typed text matches
+/// what AppKit's insertText would produce: with Caps Lock on, `a` types `A`,
+/// Shift+`a` still types `A` (macOS does not invert Caps Lock with Shift),
+/// and digits and symbols are left to the layout. `key` stays lowercase, so
+/// key bindings match the same with Caps Lock on or off.
+fn key_char_layout_modifiers(shift: bool, alt: bool, caps_lock: bool) -> u32 {
+    let mut mods = NO_MOD;
+    if shift {
+        mods |= SHIFT_MOD;
+    }
+    if caps_lock {
+        mods |= ALPHA_LOCK_MOD;
+    }
+    if alt {
+        mods |= OPTION_MOD;
+    }
+    mods
+}
 
 fn chars_for_modified_key(code: CGKeyCode, modifiers: u32) -> String {
     // Values from: https://github.com/phracker/MacOSX-SDKs/blob/master/MacOSX10.6.sdk/System/Library/Frameworks/Carbon.framework/Versions/A/Frameworks/HIToolbox.framework/Versions/A/Headers/Events.h#L126
@@ -569,4 +586,61 @@ fn chars_for_modified_key(code: CGKeyCode, modifiers: u32) -> String {
         let _: () = msg_send![keyboard, release];
     }
     String::from_utf16(&buffer[..buffer_size]).unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // kVK_ANSI_A, kVK_ANSI_1, kVK_ANSI_LeftBracket, kVK_ANSI_Semicolon.
+    const KEY_A: CGKeyCode = 0x00;
+    const KEY_1: CGKeyCode = 0x12;
+    const KEY_LEFT_BRACKET: CGKeyCode = 0x21;
+    const KEY_SEMICOLON: CGKeyCode = 0x29;
+
+    #[test]
+    fn key_char_layout_modifiers_include_caps_lock() {
+        assert_eq!(key_char_layout_modifiers(false, false, false), NO_MOD);
+        assert_eq!(key_char_layout_modifiers(true, false, false), SHIFT_MOD);
+        assert_eq!(
+            key_char_layout_modifiers(false, false, true),
+            ALPHA_LOCK_MOD
+        );
+        assert_eq!(
+            key_char_layout_modifiers(true, false, true),
+            SHIFT_MOD | ALPHA_LOCK_MOD
+        );
+        assert_eq!(
+            key_char_layout_modifiers(false, true, true),
+            OPTION_MOD | ALPHA_LOCK_MOD
+        );
+    }
+
+    /// Runs the real UCKeyTranslate against the current layout. The
+    /// expectations are those of the US/ABC layouts, so other layouts skip.
+    #[test]
+    fn caps_lock_uppercases_letters_in_key_char_on_us_layouts() {
+        if chars_for_modified_key(KEY_A, NO_MOD) != "a"
+            || chars_for_modified_key(KEY_1, NO_MOD) != "1"
+            || chars_for_modified_key(KEY_LEFT_BRACKET, NO_MOD) != "["
+        {
+            eprintln!("skipped: the current keyboard layout is not US/ABC");
+            return;
+        }
+        let typed = |code, shift, alt, caps_lock| {
+            chars_for_modified_key(code, key_char_layout_modifiers(shift, alt, caps_lock))
+        };
+        assert_eq!(typed(KEY_A, false, false, false), "a");
+        assert_eq!(typed(KEY_A, false, false, true), "A");
+        assert_eq!(typed(KEY_A, true, false, false), "A");
+        assert_eq!(typed(KEY_A, true, false, true), "A");
+        assert_eq!(typed(KEY_A, false, true, false), "\u{e5}");
+        assert_eq!(typed(KEY_A, false, true, true), "\u{c5}");
+        assert_eq!(typed(KEY_1, false, false, true), "1");
+        assert_eq!(typed(KEY_1, true, false, true), "!");
+        assert_eq!(typed(KEY_LEFT_BRACKET, false, false, true), "[");
+        assert_eq!(typed(KEY_SEMICOLON, false, false, true), ";");
+        // Key bindings read the unmodified layout, which Caps Lock never changes.
+        assert_eq!(chars_for_modified_key(KEY_A, NO_MOD), "a");
+    }
 }
