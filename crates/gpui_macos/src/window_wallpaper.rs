@@ -41,6 +41,11 @@ unsafe extern "C" {
     static NSApplicationDidBecomeActiveNotification: Id;
 }
 
+#[link(name = "AppKit", kind = "framework")]
+unsafe extern "C" {
+    static NSImageCompressionFactor: Id;
+}
+
 #[link(name = "CoreImage", kind = "framework")]
 unsafe extern "C" {
     static kCIImageApplyOrientationProperty: Id;
@@ -127,6 +132,73 @@ pub(crate) unsafe fn wallpaper_for_window(
             screen_frame,
         })
     }
+}
+
+/// `wallpaper`'s blurred picture as a JPEG no wider than `max_width` pixels, for a web page that
+/// draws the same glass (`background_wallpaper_snapshot`). Under a blur the picture is already a
+/// fraction of the screen's size, so this is a few dozen kilobytes.
+pub(crate) unsafe fn jpeg(wallpaper: &Wallpaper, max_width: u32) -> Option<Vec<u8>> {
+    autoreleasepool(|_| unsafe {
+        let source: Id =
+            msg_send![class!(CIImage), imageWithCGImage: wallpaper.image.cast::<CGImage>()];
+        if source.is_null() {
+            return None;
+        }
+        let extent: NSRect = msg_send![source, extent];
+        if extent.size.width < 1.0 || extent.size.height < 1.0 {
+            return None;
+        }
+        let scale = (f64::from(max_width.max(1)) / extent.size.width).min(1.0);
+        let transform = AffineTransform {
+            a: scale,
+            b: 0.0,
+            c: 0.0,
+            d: scale,
+            tx: -extent.origin.x * scale,
+            ty: -extent.origin.y * scale,
+        };
+        let scaled: Id = msg_send![source, imageByApplyingTransform: transform];
+        let rect = NSRect::new(
+            NSPoint::new(0.0, 0.0),
+            NSSize::new(
+                (extent.size.width * scale).round().max(1.0),
+                (extent.size.height * scale).round().max(1.0),
+            ),
+        );
+        let context = *CONTEXT.get_or_init(|| {
+            let context: Id = msg_send![class!(CIContext), contextWithOptions: NIL];
+            let context: Id = msg_send![context, retain];
+            context as usize
+        }) as Id;
+        let image: *mut CGImage = msg_send![context, createCGImage: scaled, fromRect: rect];
+        if image.is_null() {
+            return None;
+        }
+        let rep: Id = msg_send![class!(NSBitmapImageRep), alloc];
+        let rep: Id = msg_send![rep, initWithCGImage: image];
+        CFRelease(image as CFTypeRef);
+        if rep.is_null() {
+            return None;
+        }
+        let factor: Id = msg_send![class!(NSNumber), numberWithDouble: 0.8f64];
+        let properties: Id = msg_send![
+            class!(NSDictionary),
+            dictionaryWithObject: factor,
+            forKey: NSImageCompressionFactor
+        ];
+        // `NSBitmapImageFileTypeJPEG`.
+        let data: Id = msg_send![rep, representationUsingType: 3usize, properties: properties];
+        let bytes = if data.is_null() {
+            None
+        } else {
+            let length: usize = msg_send![data, length];
+            let start: *const u8 = msg_send![data, bytes];
+            (!start.is_null() && length > 0)
+                .then(|| std::slice::from_raw_parts(start, length).to_vec())
+        };
+        let _: () = msg_send![rep, release];
+        bytes
+    })
 }
 
 /// The desktop picture of `screen`, how the desktop places it, and its cache key.

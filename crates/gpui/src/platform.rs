@@ -1306,6 +1306,13 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     /// For a picture attached to the window: the rectangle, in window coordinates, the picture
     /// covers instead of the window itself; `None` covers the window.
     fn set_background_wallpaper_cover(&self, _cover: Option<Bounds<Pixels>>) {}
+    /// Ghostex: the picture a wallpaper background shows right now, already blurred, as a JPEG no
+    /// wider than `max_width` pixels, for drawing the same glass elsewhere (a web page the app
+    /// shows). `None` while the background shows anything else (a live blur, a video, a live
+    /// style) or on platforms that keep the picture to themselves.
+    fn background_wallpaper_snapshot(&self, _max_width: u32) -> Option<WallpaperSnapshot> {
+        None
+    }
     /// A looping, muted video a wallpaper background plays, blurred, in place of its picture;
     /// `None` goes back to the picture. `only_on_power` pauses it while the computer runs on
     /// battery.
@@ -2978,6 +2985,20 @@ pub enum WindowBackgroundAppearance {
     MicaBackdrop,
     /// The Mica Alt backdrop material, supported on Windows 11.
     MicaAltBackdrop,
+}
+
+/// Ghostex: what a wallpaper background shows, from
+/// [`PlatformWindow::background_wallpaper_snapshot`]: the blurred picture laid out on the whole
+/// screen the way the background shows it, the size of that screen, and where the window sits on
+/// it (top-left origin, in points).
+#[derive(Clone, Debug)]
+pub struct WallpaperSnapshot {
+    /// The picture as JPEG bytes, covering the whole screen.
+    pub jpeg: Vec<u8>,
+    /// The size of the screen the picture covers.
+    pub screen: Size<Pixels>,
+    /// The window's frame on that screen.
+    pub window: Bounds<Pixels>,
 }
 
 /// Ghostex: how a [`WindowBackgroundAppearance::Blurred`] window blurs the windows and desktop

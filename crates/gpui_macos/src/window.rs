@@ -2076,6 +2076,35 @@ impl PlatformWindow for MacWindow {
         }
     }
 
+    fn background_wallpaper_snapshot(&self, max_width: u32) -> Option<gpui::WallpaperSnapshot> {
+        let this = self.0.as_ref().lock();
+        // Only while the picture itself shows: not the live blur, a video or a live style.
+        this.wallpaper_view?;
+        unsafe {
+            let wallpaper = window_wallpaper::wallpaper_for_window(
+                this.native_window,
+                this.background_wallpaper_image.as_deref(),
+                this.background_blur_style.0,
+            )?;
+            let jpeg = window_wallpaper::jpeg(&wallpaper, max_width)?;
+            let screen = wallpaper.screen_frame;
+            let frame: NSRect = msg_send![this.native_window, frame];
+            Some(gpui::WallpaperSnapshot {
+                jpeg,
+                screen: size(px(screen.size.width as f32), px(screen.size.height as f32)),
+                window: Bounds::new(
+                    point(
+                        px((frame.origin.x - screen.origin.x) as f32),
+                        px(((screen.origin.y + screen.size.height)
+                            - (frame.origin.y + frame.size.height))
+                            as f32),
+                    ),
+                    size(px(frame.size.width as f32), px(frame.size.height as f32)),
+                ),
+            })
+        }
+    }
+
     fn set_background_wallpaper_follows_screen(&self, follows_screen: bool) {
         let mut this = self.0.as_ref().lock();
         if this.background_wallpaper_follows_screen == follows_screen {

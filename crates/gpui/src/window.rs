@@ -3251,6 +3251,16 @@ impl Window {
         self.platform_window.set_background_wallpaper_image(image);
     }
 
+    /// Ghostex: the picture this window's wallpaper background shows right now, blurred, as a JPEG
+    /// no wider than `max_width`, with the screen it covers and where the window sits on it.
+    /// `None` while the background shows anything else.
+    pub fn background_wallpaper_snapshot(
+        &self,
+        max_width: u32,
+    ) -> Option<crate::WallpaperSnapshot> {
+        self.platform_window.background_wallpaper_snapshot(max_width)
+    }
+
     /// Whether a wallpaper background's picture stays still against the screen while the window
     /// moves, or (the default) is attached to the window and covers it, which needs no update
     /// while the window is dragged.
