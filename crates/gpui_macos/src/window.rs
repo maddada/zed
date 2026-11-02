@@ -2078,8 +2078,11 @@ impl PlatformWindow for MacWindow {
 
     fn background_wallpaper_snapshot(&self, max_width: u32) -> Option<gpui::WallpaperSnapshot> {
         let this = self.0.as_ref().lock();
-        // Only while the picture itself shows: not the live blur, a video or a live style.
-        this.wallpaper_view?;
+        // Not while a video or a live style shows instead of the picture. Under the live blur it
+        // is the desktop picture, which is what that blur mostly shows.
+        if this.background_video.is_some() || this.background_live.is_some() {
+            return None;
+        }
         unsafe {
             let wallpaper = window_wallpaper::wallpaper_for_window(
                 this.native_window,

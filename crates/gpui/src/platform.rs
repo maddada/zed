@@ -1308,8 +1308,8 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn set_background_wallpaper_cover(&self, _cover: Option<Bounds<Pixels>>) {}
     /// Ghostex: the picture a wallpaper background shows right now, already blurred, as a JPEG no
     /// wider than `max_width` pixels, for drawing the same glass elsewhere (a web page the app
-    /// shows). `None` while the background shows anything else (a live blur, a video, a live
-    /// style) or on platforms that keep the picture to themselves.
+    /// shows). Under the live blur it is the desktop picture that blur mostly shows. `None` while
+    /// a video or a live style shows, or on platforms that keep the picture to themselves.
     fn background_wallpaper_snapshot(&self, _max_width: u32) -> Option<WallpaperSnapshot> {
         None
     }

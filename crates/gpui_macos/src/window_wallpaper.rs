@@ -79,6 +79,8 @@ static VIEW_CLASS: OnceLock<usize> = OnceLock::new();
 pub(crate) struct Wallpaper {
     image: Id,
     pub(crate) screen_frame: NSRect,
+    /// The picture's cache key, which names the picture, its placement, screen size and blur.
+    key: String,
 }
 
 /// The blurred picture behind `window`: `image` when the app chose one, otherwise the desktop
@@ -123,21 +125,39 @@ pub(crate) unsafe fn wallpaper_for_window(
             return Some(Wallpaper {
                 image,
                 screen_frame,
+                key,
             });
         }
         let image = render_blurred(url, &placement, screen_frame.size, blur_radius)?;
-        store(key, image);
+        store(key.clone(), image);
         Some(Wallpaper {
             image,
             screen_frame,
+            key,
         })
     }
 }
 
 /// `wallpaper`'s blurred picture as a JPEG no wider than `max_width` pixels, for a web page that
 /// draws the same glass (`background_wallpaper_snapshot`). Under a blur the picture is already a
-/// fraction of the screen's size, so this is a few dozen kilobytes.
+/// fraction of the screen's size, so this is a few dozen kilobytes. The last one is kept, so a
+/// page that asks again to notice a new wallpaper costs no encoding while it stays the same.
 pub(crate) unsafe fn jpeg(wallpaper: &Wallpaper, max_width: u32) -> Option<Vec<u8>> {
+    let key = format!("{}|{max_width}", wallpaper.key);
+    if let Some((cached_key, bytes)) = JPEG_CACHE.lock().as_ref()
+        && *cached_key == key
+    {
+        return Some(bytes.clone());
+    }
+    let bytes = unsafe { encode_jpeg(wallpaper, max_width) }?;
+    *JPEG_CACHE.lock() = Some((key, bytes.clone()));
+    Some(bytes)
+}
+
+/// The last JPEG `jpeg` made, by its picture's cache key and width.
+static JPEG_CACHE: Mutex<Option<(String, Vec<u8>)>> = Mutex::new(None);
+
+unsafe fn encode_jpeg(wallpaper: &Wallpaper, max_width: u32) -> Option<Vec<u8>> {
     autoreleasepool(|_| unsafe {
         let source: Id =
             msg_send![class!(CIImage), imageWithCGImage: wallpaper.image.cast::<CGImage>()];

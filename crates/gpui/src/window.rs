@@ -3253,7 +3253,7 @@ impl Window {
 
     /// Ghostex: the picture this window's wallpaper background shows right now, blurred, as a JPEG
     /// no wider than `max_width`, with the screen it covers and where the window sits on it.
-    /// `None` while the background shows anything else.
+    /// Under the live blur it is the desktop picture; `None` while a video or a live style shows.
     pub fn background_wallpaper_snapshot(
         &self,
         max_width: u32,
