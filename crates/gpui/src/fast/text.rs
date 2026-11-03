@@ -42,6 +42,10 @@ pub(crate) struct TextMeasureInputs {
     text_style: Rc<TextStyle>,
     font_size: Pixels,
     line_height: Pixels,
+    /// [`fonts_generation`] when these were taken. A family's name draws in another font after a
+    /// font is added or a substitution set, so a measurement from before that shaped something
+    /// else even though every input here reads the same.
+    fonts_generation: u64,
     /// The layout of the element whose inputs these are, or of a later one
     /// that took the measurement over while leaving the node with these.
     layout: RefCell<TextLayout>,
@@ -133,6 +137,7 @@ impl TextMeasureInputs {
         }
         let (style, other_style) = (&*self.text_style, &*other.text_style);
         if !(self.text == other.text
+            && self.fonts_generation == other.fonts_generation
             && self.font_size == other.font_size
             && self.line_height == other.line_height
             && style.white_space == other_style.white_space
@@ -229,6 +234,7 @@ fn measure_inputs(
         text_style,
         font_size,
         line_height,
+        fonts_generation: fonts_generation(),
         layout: RefCell::new(layout.clone()),
     }
 }
@@ -382,6 +388,7 @@ fn measure_text(
         font_size,
         line_height,
         layout,
+        fonts_generation: _,
     } = inputs;
     let layout = &*layout.borrow();
     let (font_size, line_height) = (*font_size, *line_height);
@@ -1049,12 +1056,16 @@ thread_local! {
         const { std::cell::RefCell::new(SmallVec::new_const()) };
 }
 
-/// Resolves `font` as [`TextSystem::resolve_font`] does, remembering the few
-/// fonts resolved lately: every run of every line shaped asks for its font,
-/// and looking it up hashes the font and takes a lock each time, where a
-/// frame's text uses a handful of fonts.
+/// Resolves `font` with `resolve`, upstream's [`TextSystem::resolve_font`],
+/// remembering the few fonts resolved lately: every run of every line shaped
+/// asks for its font, and looking it up in the text system hashes the font
+/// and takes a lock each time, where a frame's text uses a handful of fonts.
 #[inline]
-pub(crate) fn resolve_font(text_system: &crate::TextSystem, font: &crate::Font) -> crate::FontId {
+pub(crate) fn remembered_font(
+    text_system: &crate::TextSystem,
+    font: &crate::Font,
+    resolve: impl FnOnce() -> crate::FontId,
+) -> crate::FontId {
     let generation = FONTS_GENERATION.load(Ordering::Relaxed);
     let platform = &text_system.platform_text_system;
     let remembered = RESOLVED.with_borrow(|resolved| {
@@ -1069,7 +1080,7 @@ pub(crate) fn resolve_font(text_system: &crate::TextSystem, font: &crate::Font) 
     if let Some(font_id) = remembered {
         return font_id;
     }
-    let font_id = resolve_font_uncached(text_system, font);
+    let font_id = resolve();
     RESOLVED.with_borrow_mut(|resolved| {
         if resolved.len() == RESOLVED_FONTS {
             resolved.remove(0);
@@ -1084,80 +1095,31 @@ pub(crate) fn resolve_font(text_system: &crate::TextSystem, font: &crate::Font) 
     font_id
 }
 
-/// [`TextSystem::resolve_font`]: the font, or else the first of the
-/// fallbacks that resolves with the features asked for, or else upstream's
-/// plain fallback.
+/// The first of the `fallbacks` that resolves for `font`, which did not
+/// resolve itself: each in the weight and style asked for, with the features
+/// asked for, where the fallback family has them, and else as the stack
+/// names it. `lookup` is upstream's cached font lookup.
 ///
-/// Upstream resolves a fallback as the fallback stack names it, plain: its
-/// features — tabular numerals, say — dropped, so digits of a family that
-/// isn't installed took their proportional widths, and a ticking price
-/// changed width, and laid out its row again, every time it changed. The
-/// fallback's weight and style stay upstream's.
-fn resolve_font_uncached(text_system: &crate::TextSystem, font: &crate::Font) -> crate::FontId {
-    if let Some(
-        crate::text_system::CachedFont::Direct(font_id)
-        | crate::text_system::CachedFont::Fallback(font_id),
-    ) = text_system.font_ids_by_font.read().get(font)
-    {
-        return *font_id;
-    }
-    let mut font_error = None;
-    if let Some(font_id) = cached_font_id(text_system, font, font, &mut font_error) {
-        return font_id;
-    }
-    for fallback in &text_system.fallback_font_stack {
-        let as_asked = crate::Font {
-            features: font.features.clone(),
-            ..fallback.clone()
-        };
-        if let Some(font_id) = cached_font_id(text_system, &as_asked, font, &mut font_error) {
-            if let Some(error) = font_error {
-                log::warn!("failed to load font {font:?}: {error:#}");
-            }
-            text_system.font_ids_by_font.write().insert(
-                font.clone(),
-                crate::text_system::CachedFont::Fallback(font_id),
-            );
-            return font_id;
-        }
-    }
-    // No fallback has the font as asked: upstream's resolution takes the
-    // first fallback as the stack names it, or panics.
-    text_system.resolve_font_uncached(font)
-}
-
-/// `candidate`'s own font id, looked up once per text system and remembered
-/// in upstream's cache, misses included. Only a miss for the font `asked`
-/// for is reported, as upstream reports only explicitly requested fonts.
-fn cached_font_id(
-    text_system: &crate::TextSystem,
-    candidate: &crate::Font,
-    asked: &crate::Font,
-    font_error: &mut Option<Arc<anyhow::Error>>,
+/// Upstream resolves a fallback as the fallback stack names it, plain: text
+/// asked for in bold came out regular, and with its features — tabular
+/// numerals, say — dropped, so digits of a family that isn't installed took
+/// their proportional widths, and a ticking price changed width, and laid
+/// out its row again, every time it changed.
+pub(crate) fn find_fallback(
+    font: &crate::Font,
+    fallbacks: &[crate::Font],
+    mut lookup: impl FnMut(&crate::Font) -> Option<crate::FontId>,
 ) -> Option<crate::FontId> {
-    use crate::text_system::CachedFont;
-    let cached = text_system.font_ids_by_font.read().get(candidate).cloned();
-    let cached = cached.unwrap_or_else(|| {
-        let cached = match text_system.platform_text_system.font_id(candidate) {
-            Ok(font_id) => CachedFont::Direct(font_id),
-            Err(error) => CachedFont::Missing(Arc::new(error)),
+    fallbacks.iter().find_map(|fallback| {
+        let as_asked = crate::Font {
+            family: fallback.family.clone(),
+            features: font.features.clone(),
+            fallbacks: font.fallbacks.clone(),
+            weight: font.weight,
+            style: font.style,
         };
-        text_system
-            .font_ids_by_font
-            .write()
-            .insert(candidate.clone(), cached.clone());
-        cached
-    });
-    match cached {
-        CachedFont::Direct(font_id) => Some(font_id),
-        CachedFont::Fallback(_) => None,
-        CachedFont::Missing(error) => {
-            if candidate == asked {
-                *font_error = Some(error);
-            }
-            None
-        }
-    }
+        lookup(&as_asked).or_else(|| lookup(fallback))
+    })
 }
 
 #[cfg(test)]
@@ -1188,6 +1150,7 @@ mod tests {
                 text_style,
                 font_size,
                 line_height,
+                fonts_generation: super::fonts_generation(),
                 layout: RefCell::new(TextLayout::default()),
             };
             let probe = |width| Size {

@@ -119,6 +119,7 @@ pub struct WaylandWindowState {
     /// mustn't outlive the window, which a display mode switch relies on.
     pub(crate) renderer: Option<WgpuRenderer>,
     pub(crate) fast_composition: crate::fast::composition::wayland::Composition,
+    glass: crate::linux::glass::Glass,
     bounds: Bounds<Pixels>,
     scale: f32,
     input_handler: Option<PlatformInputHandler>,
@@ -591,6 +592,13 @@ impl WaylandWindowState {
             WgpuRenderer::new(gpu_context, &raw_window, config, compositor_gpu)?
         };
 
+        let mut glass = crate::linux::glass::Glass::with_wake(globals.frame_ping.clone());
+        glass.title = options
+            .titlebar
+            .as_ref()
+            .and_then(|bar| bar.title.as_ref())
+            .map(ToString::to_string)
+            .unwrap_or_default();
         if let WaylandSurfaceState::Xdg(ref xdg_state) = surface_state {
             if let Some(title) = options.titlebar.and_then(|titlebar| titlebar.title) {
                 xdg_state.toplevel.set_title(title.to_string());
@@ -631,6 +639,7 @@ impl WaylandWindowState {
             scale: 1.0,
             input_handler: None,
             decorations: WindowDecorations::Client,
+            glass,
             background_appearance: WindowBackgroundAppearance::Opaque,
             fullscreen: false,
             maximized: false,
@@ -1034,6 +1043,9 @@ impl WaylandWindowStatePtr {
     }
 
     pub fn scheduled_frame_fired(&self) {
+        if self.state.borrow().glass.needs_frame() {
+            self.request_redraw();
+        }
         if self.frame_loop.get() == FrameLoop::Scheduled {
             self.frame(
                 self.scheduled_frame_at.take(),
@@ -1127,6 +1139,8 @@ impl WaylandWindowStatePtr {
                     state.tiling = configure.tiling;
                     let visibility_changed = state.visibility != configure.visibility;
                     state.visibility = configure.visibility;
+                    let active = state.active && state.visibility.is_visible();
+                    state.glass.set_active(active);
                     // Limit interactive resizes to once per vblank
                     let throttled = configure.resizing && state.resize_throttle;
                     if throttled {
@@ -1620,7 +1634,12 @@ impl WaylandWindowStatePtr {
     }
 
     pub fn set_focused(&self, focus: bool) {
-        self.state.borrow_mut().active = focus;
+        {
+            let mut state = self.state.borrow_mut();
+            state.active = focus;
+            let active = focus && state.visibility.is_visible();
+            state.glass.set_active(active);
+        }
         let callback = self.callbacks.borrow_mut().active_status_change.take();
         if let Some(mut fun) = callback {
             fun(focus);
@@ -1914,6 +1933,7 @@ impl PlatformWindow for WaylandWindow {
     }
 
     fn set_title(&mut self, title: &str) {
+        self.borrow_mut().glass.title = title.to_owned();
         if let Some(toplevel) = self.borrow().surface_state.toplevel() {
             toplevel.set_title(title.to_string());
         }
@@ -1935,6 +1955,30 @@ impl PlatformWindow for WaylandWindow {
         state.background_appearance = background_appearance;
         update_window(state);
         self.0.request_redraw();
+    }
+
+    fn set_background_wallpaper(&self, enabled: bool) {
+        self.borrow_mut().glass.enabled = enabled;
+    }
+    fn set_background_wallpaper_image(&self, image: Option<std::path::PathBuf>) {
+        self.borrow_mut().glass.image = image;
+    }
+    fn set_background_wallpaper_follows_screen(&self, follows: bool) {
+        self.borrow_mut().glass.follows_screen = follows;
+    }
+    fn set_background_wallpaper_cover(&self, cover: Option<Bounds<Pixels>>) {
+        self.borrow_mut().glass.cover = cover;
+    }
+    fn set_background_blur_style(&self, radius: Pixels, _keep_saturation: bool) {
+        self.borrow_mut().glass.set_blur_radius(radius);
+    }
+    fn set_background_live(&self, live: Option<gpui::LiveBackground>) {
+        self.borrow_mut().glass.live = live;
+    }
+    fn set_background_video(&self, video: Option<std::path::PathBuf>, only_on_power: bool) {
+        let mut state = self.borrow_mut();
+        state.glass.video = video;
+        state.glass.only_on_power = only_on_power;
     }
 
     fn background_appearance(&self) -> WindowBackgroundAppearance {
@@ -2023,7 +2067,10 @@ impl PlatformWindow for WaylandWindow {
         self.0.callbacks.borrow_mut().close = Some(callback);
     }
 
-    fn on_hit_test_window_control(&self, _callback: Box<dyn FnMut() -> Option<WindowControlArea>>) {
+    fn on_hit_test_window_control(
+        &self,
+        _callback: Box<dyn FnMut(gpui::Point<gpui::Pixels>) -> Option<WindowControlArea>>,
+    ) {
     }
 
     fn on_appearance_changed(&self, callback: Box<dyn FnMut()>) {
@@ -2073,6 +2120,25 @@ impl PlatformWindow for WaylandWindow {
             let callback = state.surface.frame(&state.globals.qh, state.surface.id());
             state.pending_frame_callback = Some(callback);
         }
+        let active = state.active && state.visibility.is_visible();
+        let bounds = state.bounds;
+        let screen = state
+            .display
+            .as_ref()
+            .map(|(_, display)| display.bounds.to_pixels(state.scale))
+            .unwrap_or(bounds);
+        let monitor = state
+            .display
+            .as_ref()
+            .and_then(|(_, display)| display.name.clone());
+        let light = matches!(
+            state.appearance,
+            WindowAppearance::Light | WindowAppearance::VibrantLight
+        );
+        let frame = state
+            .glass
+            .frame(active, bounds, screen, monitor, light, true);
+        renderer.set_glass_frame(frame);
         if renderer.draw(scene) {
             state.presentation = PresentationState::Presented;
             self.0.frame_loop.set(FrameLoop::AwaitingCallback);
@@ -2081,7 +2147,7 @@ impl PlatformWindow for WaylandWindow {
             self.0.frame_loop.set(FrameLoop::PresentationFailed);
         }
 
-        if renderer.needs_redraw() {
+        if renderer.needs_redraw() || state.glass.needs_frame() {
             state.redraw_requested = true;
         }
     }

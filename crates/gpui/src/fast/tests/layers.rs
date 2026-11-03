@@ -228,6 +228,14 @@ fn content_in_parts_draws_each_tile_as_one_scene_does() {
             PaintOperation::FastRoundedClip(clip) => {
                 crate::fast::rounded_clip::record(&mut whole, *clip)
             }
+            #[cfg(target_os = "macos")]
+            PaintOperation::StartEffect {
+                effect,
+                bounds,
+                content_mask,
+            } => whole.push_effect(effect.clone(), *bounds, *content_mask),
+            #[cfg(target_os = "macos")]
+            PaintOperation::EndEffect => whole.pop_effect(),
         }
     }
     whole.finish();
@@ -243,6 +251,18 @@ fn content_in_parts_draws_each_tile_as_one_scene_does() {
                 PaintOperation::StartLayer(bounds) => PaintOperation::StartLayer(*bounds),
                 PaintOperation::EndLayer => PaintOperation::EndLayer,
                 PaintOperation::FastRoundedClip(clip) => PaintOperation::FastRoundedClip(*clip),
+                #[cfg(target_os = "macos")]
+                PaintOperation::StartEffect {
+                    effect,
+                    bounds,
+                    content_mask,
+                } => PaintOperation::StartEffect {
+                    effect: effect.clone(),
+                    bounds: *bounds,
+                    content_mask: *content_mask,
+                },
+                #[cfg(target_os = "macos")]
+                PaintOperation::EndEffect => PaintOperation::EndEffect,
             })
             .collect();
         LayerPart {
@@ -1858,7 +1878,7 @@ mod invalidation {
                     delta: ScrollDelta::Pixels(point(px(0.), px(dy))),
                     modifiers: Default::default(),
                     touch_phase: TouchPhase::Moved,
-                    ..Default::default()
+                    source: crate::ScrollSource::Pointer,
                 }),
                 cx,
             );
@@ -2275,7 +2295,7 @@ mod decisions {
                         delta: ScrollDelta::Pixels(point(px(0.), px(dy))),
                         modifiers: Default::default(),
                         touch_phase: TouchPhase::Moved,
-                        ..Default::default()
+                        source: crate::ScrollSource::Pointer,
                     }),
                     cx,
                 );
@@ -2446,7 +2466,7 @@ mod decisions {
                         delta: ScrollDelta::Pixels(point(px(0.), px(-20.))),
                         modifiers: Default::default(),
                         touch_phase: TouchPhase::Moved,
-                        ..Default::default()
+                        source: crate::ScrollSource::Pointer,
                     }),
                     cx,
                 );
@@ -3348,7 +3368,7 @@ mod input {
                         delta: ScrollDelta::Pixels(point(px(0.), px(dy))),
                         modifiers: Default::default(),
                         touch_phase: TouchPhase::Moved,
-                        ..Default::default()
+                        source: crate::ScrollSource::Pointer,
                     }),
                     cx,
                 );
@@ -4106,7 +4126,7 @@ mod integration {
                             delta: crate::ScrollDelta::Pixels(point(px(0.), px(dy))),
                             modifiers: Default::default(),
                             touch_phase: crate::TouchPhase::Moved,
-                            ..Default::default()
+                            source: crate::ScrollSource::Pointer,
                         }),
                         cx,
                     );

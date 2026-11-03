@@ -140,7 +140,7 @@ fn scroll_both(cx: &mut TestAppContext, update: bool, events: usize) -> usize {
                             delta: ScrollDelta::Pixels(point(px(0.), px(dy))),
                             modifiers: Default::default(),
                             touch_phase: TouchPhase::Moved,
-                            ..Default::default()
+                            source: crate::ScrollSource::Pointer,
                         }),
                         cx,
                     );

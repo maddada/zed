@@ -22,7 +22,7 @@
 use std::{mem, ops::Range, ptr};
 
 use anyhow::{Context as _, Result};
-use gpui::{Bounds, DevicePixels, PrimitiveBatch, ScaledPixels, Scene, Size};
+use gpui::{Bounds, DevicePixels, PrimitiveBatch, ScaledPixels, Scene, SceneBatch, Size};
 use objc2::{rc::Retained, runtime::ProtocolObject};
 use objc2_core_foundation::CFRetained;
 use objc2_core_video::CVMetalTexture;
@@ -69,6 +69,13 @@ pub(crate) fn draw_primitives_to_texture(
     viewport_size: Size<DevicePixels>,
     surface_textures: &mut Vec<CFRetained<CVMetalTexture>>,
 ) -> Result<Option<Retained<ProtocolObject<dyn MTLCommandBuffer>>>> {
+    // Ghostex: the window's path textures are allocated by the first frame that draws a path
+    // (and freed while the window is hidden), so allocate them before either renderer below
+    // rasterizes paths through them; the rounded-clip one reads them too, for the paths of the
+    // scenes it clips as well as the frame's own.
+    if crate::fast::rounded_clip::draws_paths(scene) {
+        renderer.ensure_window_path_textures(viewport_size)?;
+    }
     if crate::fast::rounded_clip::has_groups(scene) {
         return crate::fast::rounded_clip::draw(
             renderer,
@@ -118,8 +125,26 @@ pub(crate) fn draw_primitives_to_texture(
         }),
     )?;
     let mut path_batches = path_batches.iter().enumerate();
+    // The textures `rasterize_group` draws into, which the paths are copied from.
+    let path_textures = renderer.window_path_textures();
 
-    for batch in scene.batches() {
+    for batch in scene.scene_batches() {
+        let batch = match batch {
+            SceneBatch::Primitives(batch) => batch,
+            SceneBatch::Effect(effect_index) => {
+                command_encoder = renderer.encode_effect(
+                    scene,
+                    effect_index,
+                    writer,
+                    &command_buffer,
+                    texture,
+                    viewport_size,
+                    &command_encoder,
+                    surface_textures,
+                )?;
+                continue;
+            }
+        };
         match batch {
             PrimitiveBatch::Shadows(range) => {
                 renderer.draw_shadows(range, instance_bindings, viewport_size, &command_encoder)
@@ -160,6 +185,7 @@ pub(crate) fn draw_primitives_to_texture(
                     writer,
                     viewport_size,
                     &command_encoder,
+                    &path_textures,
                 ) {
                     command_encoder.endEncoding();
                     return Err(error);
