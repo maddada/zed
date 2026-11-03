@@ -1113,43 +1113,79 @@ pub(crate) fn resolve_font(text_system: &crate::TextSystem, font: &crate::Font) 
 }
 
 /// [`TextSystem::resolve_font`]: the font, or else the first of the
-/// fallbacks that resolves — in the weight and style asked for, with the
-/// features asked for, where the fallback family has them.
+/// fallbacks that resolves with the features asked for, or else upstream's
+/// plain fallback.
 ///
-/// Upstream resolves a fallback as the fallback stack names it, plain: text
-/// asked for in bold came out regular, and with its features — tabular
-/// numerals, say — dropped, so digits of a family that isn't installed took
-/// their proportional widths, and a ticking price changed width, and laid
-/// out its row again, every time it changed.
+/// Upstream resolves a fallback as the fallback stack names it, plain: its
+/// features — tabular numerals, say — dropped, so digits of a family that
+/// isn't installed took their proportional widths, and a ticking price
+/// changed width, and laid out its row again, every time it changed. The
+/// fallback's weight and style stay upstream's.
 fn resolve_font_uncached(text_system: &crate::TextSystem, font: &crate::Font) -> crate::FontId {
-    if let Ok(font_id) = text_system.font_id(font) {
+    if let Some(
+        crate::text_system::CachedFont::Direct(font_id)
+        | crate::text_system::CachedFont::Fallback(font_id),
+    ) = text_system.font_ids_by_font.read().get(font)
+    {
+        return *font_id;
+    }
+    let mut font_error = None;
+    if let Some(font_id) = cached_font_id(text_system, font, font, &mut font_error) {
         return font_id;
     }
     for fallback in &text_system.fallback_font_stack {
         let as_asked = crate::Font {
-            family: fallback.family.clone(),
             features: font.features.clone(),
-            fallbacks: font.fallbacks.clone(),
-            weight: font.weight,
-            style: font.style,
+            ..fallback.clone()
         };
-        if let Ok(font_id) = text_system.font_id(&as_asked) {
-            return font_id;
-        }
-        if let Ok(font_id) = text_system.font_id(fallback) {
+        if let Some(font_id) = cached_font_id(text_system, &as_asked, font, &mut font_error) {
+            if let Some(error) = font_error {
+                log::warn!("failed to load font {font:?}: {error:#}");
+            }
+            text_system.font_ids_by_font.write().insert(
+                font.clone(),
+                crate::text_system::CachedFont::Fallback(font_id),
+            );
             return font_id;
         }
     }
-    panic!(
-        "failed to resolve font '{}' or any of the fallbacks: {}",
-        font.family,
+    // No fallback has the font as asked: upstream's resolution takes the
+    // first fallback as the stack names it, or panics.
+    text_system.resolve_font_uncached(font)
+}
+
+/// `candidate`'s own font id, looked up once per text system and remembered
+/// in upstream's cache, misses included. Only a miss for the font `asked`
+/// for is reported, as upstream reports only explicitly requested fonts.
+fn cached_font_id(
+    text_system: &crate::TextSystem,
+    candidate: &crate::Font,
+    asked: &crate::Font,
+    font_error: &mut Option<Arc<anyhow::Error>>,
+) -> Option<crate::FontId> {
+    use crate::text_system::CachedFont;
+    let cached = text_system.font_ids_by_font.read().get(candidate).cloned();
+    let cached = cached.unwrap_or_else(|| {
+        let cached = match text_system.platform_text_system.font_id(candidate) {
+            Ok(font_id) => CachedFont::Direct(font_id),
+            Err(error) => CachedFont::Missing(Arc::new(error)),
+        };
         text_system
-            .fallback_font_stack
-            .iter()
-            .map(|fallback| fallback.family.to_string())
-            .collect::<Vec<_>>()
-            .join(", ")
-    );
+            .font_ids_by_font
+            .write()
+            .insert(candidate.clone(), cached.clone());
+        cached
+    });
+    match cached {
+        CachedFont::Direct(font_id) => Some(font_id),
+        CachedFont::Fallback(_) => None,
+        CachedFont::Missing(error) => {
+            if candidate == asked {
+                *font_error = Some(error);
+            }
+            None
+        }
+    }
 }
 
 #[cfg(test)]

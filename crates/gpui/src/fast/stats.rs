@@ -171,6 +171,19 @@ impl MeasureTally {
             self.time += started_at.elapsed();
         }
     }
+
+    /// Counts a measurement of `node` started by [`Self::start`], under the
+    /// constraints it was measured under, noting the leaf measured.
+    pub(crate) fn measured(
+        &mut self,
+        started_at: Option<Instant>,
+        node: taffy::NodeId,
+        known_dimensions: crate::Size<Option<crate::Pixels>>,
+        available_space: crate::Size<crate::AvailableSpace>,
+    ) {
+        self.finish(started_at);
+        self.leaves.note(node, known_dimensions, available_space);
+    }
 }
 
 impl TaffyLayoutEngine {

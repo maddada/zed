@@ -1055,6 +1055,15 @@ impl StateVersion {
 }
 
 impl crate::StateInner {
+    /// Whether the list waits to settle where it is scrolled to: a scroll
+    /// adjustment for a remeasured item, or a position held while items are
+    /// provisionally measured.
+    pub(crate) fn scroll_pending(&self) -> bool {
+        self.scroll_anchor.is_some_and(|anchor| {
+            anchor.pending.is_some() || anchor.provisional || anchor.pending_end
+        })
+    }
+
     /// Marks the list's state changed if pausing it stops it following its
     /// tail. See [`crate::ListState::pause_following_tail`].
     pub(crate) fn note_following_paused(&self) {
@@ -1072,7 +1081,8 @@ impl crate::StateInner {
         follow_state: crate::FollowState,
         pending: bool,
     ) {
-        let moved = scroll_top.moves_from(self.logical_scroll_top, pending);
+        let moved =
+            scroll_top.moves_from(self.scroll_anchor.map(|anchor| anchor.position), pending);
         self.version
             .bump_if(moved || self.follow_state != follow_state);
     }
@@ -1106,7 +1116,7 @@ impl ListScrollStart {
     /// waiting to be applied read from `state`.
     #[inline(always)]
     pub(crate) fn note_scrolled(self, state: &crate::StateInner, scroll_top: &ListOffset) {
-        state.note_scrolled_to(scroll_top, self.0, state.pending_scroll.is_some());
+        state.note_scrolled_to(scroll_top, self.0, state.scroll_pending());
     }
 }
 
