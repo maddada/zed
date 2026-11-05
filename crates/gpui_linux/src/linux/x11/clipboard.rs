@@ -19,7 +19,6 @@
 // https://freedesktop.org/wiki/ClipboardManager/
 
 use std::{
-    borrow::Cow,
     cell::RefCell,
     collections::{HashMap, hash_map::Entry},
     sync::{
@@ -47,7 +46,7 @@ use x11rb::{
     wrapper::ConnectionExt as _,
 };
 
-use gpui::{ClipboardItem, Image, ImageFormat, hash};
+use gpui::{ClipboardEntry, ClipboardItem, Image, ImageFormat, hash};
 use strum::IntoEnumIterator;
 
 type Result<T, E = Error> = std::result::Result<T, E>;
@@ -981,19 +980,6 @@ impl Clipboard {
         Ok(Self { inner: ctx })
     }
 
-    pub(crate) fn set_text(
-        &self,
-        message: Cow<'_, str>,
-        selection: ClipboardKind,
-        wait: WaitConfig,
-    ) -> Result<()> {
-        let data = vec![ClipboardData {
-            bytes: message.into_owned().into_bytes(),
-            format: self.inner.atoms.UTF8_STRING,
-        }];
-        self.inner.write(data, selection, wait)
-    }
-
     fn image_format_atom(&self, format: ImageFormat) -> Atom {
         match format {
             ImageFormat::Png => self.inner.atoms.PNG__MIME,
@@ -1008,18 +994,34 @@ impl Clipboard {
         }
     }
 
-    #[allow(unused)]
-    pub(crate) fn set_image(
+    /// Offers every image in the item under its own MIME target (`image/png`, ...), plus its text
+    /// as `UTF8_STRING`. An image-only item offers no text target, so pasting into a browser
+    /// gets the image instead of an empty string.
+    pub(crate) fn set_item(
         &self,
-        image: Image,
+        item: &ClipboardItem,
         selection: ClipboardKind,
         wait: WaitConfig,
     ) -> Result<()> {
-        let format = self.image_format_atom(image.format);
-        let data = vec![ClipboardData {
-            bytes: image.bytes,
-            format: self.inner.atoms.PNG__MIME,
-        }];
+        let mut data: Vec<ClipboardData> = Vec::new();
+        for entry in item.entries() {
+            if let ClipboardEntry::Image(image) = entry {
+                let format = self.image_format_atom(image.format);
+                if !data.iter().any(|existing| existing.format == format) {
+                    data.push(ClipboardData {
+                        bytes: image.bytes.clone(),
+                        format,
+                    });
+                }
+            }
+        }
+        let text = item.text().unwrap_or_default();
+        if data.is_empty() || !text.is_empty() {
+            data.push(ClipboardData {
+                bytes: text.into_bytes(),
+                format: self.inner.atoms.UTF8_STRING,
+            });
+        }
         self.inner.write(data, selection, wait)
     }
 
