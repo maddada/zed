@@ -2806,7 +2806,9 @@ fn get_scale_factor(
         DpiMode::NotSet => {}
     }
 
-    // TODO: Use scale factor from XSettings here
+    if let Some(scale) = crate::fast::x11_scale::xsettings_scale(connection, screen_index) {
+        return scale;
+    }
 
     if let Some(dpi) = resource_database
         .get_value::<f32>("Xft.dpi", "Xft.dpi")
