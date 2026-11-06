@@ -229,7 +229,8 @@ impl TaffyLayoutEngine {
                             let Some(node_context) = node_context else {
                                 return taffy::geometry::Size::default();
                             };
-                            let started = crate::fast::stats::MeasureTally::start(&measures);
+                            let measure_started_at =
+                                crate::fast::stats::MeasureTally::start(&mut measures);
 
                             let known_dimensions = Size {
                                 width: known_dimensions.width.map(|e| Pixels(e / scale_factor)),
@@ -255,9 +256,12 @@ impl TaffyLayoutEngine {
                                 window,
                                 cx,
                             );
-                            crate::fast::stats::MeasureTally::measured(
+                            crate::fast::stats::MeasureTally::finish(
                                 &mut measures,
-                                started,
+                                measure_started_at,
+                            );
+                            crate::fast::layout::MeasuredLeaves::note(
+                                &mut measures.leaves,
                                 _id,
                                 known_dimensions,
                                 available_space,

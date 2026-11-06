@@ -2,8 +2,8 @@ use crate::{
     AnyElement, AnyImageCache, App, Asset, AssetLogger, Bounds, DefiniteLength, Element, ElementId,
     Entity, GlobalElementId, Hitbox, Image, ImageCache, InspectorElementId, InteractiveElement,
     Interactivity, IntoElement, LayoutId, Length, ObjectFit, Pixels, RenderImage, Resource,
-    SharedString, SharedUri, StyleRefinement, Styled, Task, Window, decode_gif_image,
-    decode_static_image, decode_webp_image, px,
+    SharedString, SharedUri, StyleRefinement, Styled, Task, UriImageCache, Window,
+    decode_gif_image, decode_static_image, decode_webp_image, px,
 };
 use anyhow::Result;
 
@@ -529,6 +529,16 @@ impl IntoElement for Img {
 impl StatefulInteractiveElement for Img {}
 
 impl ImageSource {
+    /// The decoded image this source draws, loaded the way an `img` element in the current
+    /// element would load it; the current view is redrawn once it has loaded.
+    pub fn use_render_image(
+        &self,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Option<Result<Arc<RenderImage>, ImageCacheError>> {
+        self.use_data(window.image_cache_stack.last().cloned(), window, cx)
+    }
+
     pub(crate) fn use_data(
         &self,
         cache: Option<AnyImageCache>,
@@ -539,6 +549,9 @@ impl ImageSource {
             ImageSource::Resource(resource) => {
                 if let Some(cache) = cache {
                     cache.load(resource, window, cx)
+                } else if let Resource::Uri(_) = resource {
+                    // Ghostex: fetched images go through a bounded cache (`UriImageCache`).
+                    UriImageCache::load(resource, true, window, cx)
                 } else {
                     window.use_asset::<ImgResourceLoader>(resource, cx)
                 }
@@ -559,6 +572,8 @@ impl ImageSource {
             ImageSource::Resource(resource) => {
                 if let Some(cache) = cache {
                     cache.load(resource, window, cx)
+                } else if let Resource::Uri(_) = resource {
+                    UriImageCache::load(resource, false, window, cx)
                 } else {
                     window.get_asset::<ImgResourceLoader>(resource, cx)
                 }
@@ -570,13 +585,23 @@ impl ImageSource {
     }
 
     /// Remove this image source from the asset system
+    ///
+    /// Ghostex: a fetched image and a decoded [`Image`] also leave every window's atlas (other
+    /// than one being drawn right now), which used to keep their tiles for the life of the app.
     pub fn remove_asset(&self, cx: &mut App) {
         match self {
+            ImageSource::Resource(resource @ Resource::Uri(_)) => {
+                UriImageCache::remove(resource, cx);
+            }
             ImageSource::Resource(resource) => {
                 cx.remove_asset::<ImgResourceLoader>(resource);
             }
             ImageSource::Custom(_) | ImageSource::Render(_) => {}
-            ImageSource::Image(data) => cx.remove_asset::<AssetLogger<ImageDecoder>>(data),
+            ImageSource::Image(data) => {
+                if let Some(Ok(image)) = cx.take_asset::<AssetLogger<ImageDecoder>>(data) {
+                    cx.drop_image(image, None);
+                }
+            }
         }
     }
 
@@ -585,6 +610,9 @@ impl ImageSource {
     #[cfg(any(test, feature = "test-support"))]
     pub fn is_asset_cached(&self, cx: &App) -> bool {
         match self {
+            ImageSource::Resource(resource @ Resource::Uri(_)) => {
+                UriImageCache::contains(resource, cx)
+            }
             ImageSource::Resource(resource) => cx.has_asset::<ImgResourceLoader>(resource),
             ImageSource::Custom(_) | ImageSource::Render(_) => false,
             ImageSource::Image(data) => cx.has_asset::<AssetLogger<ImageDecoder>>(data),

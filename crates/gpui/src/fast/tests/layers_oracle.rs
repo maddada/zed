@@ -657,7 +657,7 @@ fn apply(cx: &mut TestAppContext, window: WindowHandle<LayerOracleView>, change:
                 delta: ScrollDelta::Pixels(point(px(0.), px(delta))),
                 modifiers: Modifiers::default(),
                 touch_phase: TouchPhase::Moved,
-                ..Default::default()
+                source: crate::ScrollSource::Pointer,
             }
             .to_platform_input(),
         ),

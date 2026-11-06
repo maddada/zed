@@ -6,7 +6,7 @@
 use std::{mem, ptr::NonNull};
 
 use anyhow::{Context as _, Result};
-use gpui::{AtlasTextureId, DevicePixels, LayerFrame, PrimitiveBatch, Scene, Size};
+use gpui::{AtlasTextureId, DevicePixels, LayerFrame, PrimitiveBatch, Scene, SceneBatch, Size};
 use objc2::{rc::Retained, runtime::ProtocolObject};
 use objc2_core_foundation::CFRetained;
 use objc2_core_video::CVMetalTexture;
@@ -49,6 +49,17 @@ pub(crate) fn has_groups(scene: &Scene) -> bool {
         .polychrome_sprites
         .iter()
         .any(|sprite| group(scene, sprite.tile.texture_id).is_some())
+}
+
+/// Whether drawing `scene` rasterizes a path: one of its own, or one of a
+/// scene it clips.
+pub(crate) fn draws_paths(scene: &Scene) -> bool {
+    !scene.paths.is_empty()
+        || scene.polychrome_sprites.iter().any(|sprite| {
+            group(scene, sprite.tile.texture_id)
+                .and_then(|frame| frame.content.scene())
+                .is_some_and(draws_paths)
+        })
 }
 
 pub(crate) fn default_mask(encoder: &ProtocolObject<dyn MTLRenderCommandEncoder>) {
@@ -203,7 +214,23 @@ fn encode(
     mut encoder: Retained<ProtocolObject<dyn MTLRenderCommandEncoder>>,
 ) -> Result<Retained<ProtocolObject<dyn MTLRenderCommandEncoder>>> {
     renderer.fast_layers.note_composited(scene);
-    for batch in scene.batches() {
+    for batch in scene.scene_batches() {
+        let batch = match batch {
+            SceneBatch::Primitives(batch) => batch,
+            SceneBatch::Effect(effect_index) => {
+                encoder = renderer.encode_effect(
+                    scene,
+                    effect_index,
+                    writer,
+                    commands,
+                    texture,
+                    viewport,
+                    &encoder,
+                    surface_textures,
+                )?;
+                continue;
+            }
+        };
         bind(&encoder, clips, &renderer.device);
         match batch {
             PrimitiveBatch::Shadows(range) => {
@@ -266,12 +293,24 @@ fn encode(
             PrimitiveBatch::Paths(range) => {
                 encoder.endEncoding();
                 let paths = &scene.paths[range];
-                let drawn =
-                    renderer.draw_paths_to_intermediate(paths, writer, viewport, commands)?;
+                let path_textures = renderer.window_path_textures();
+                let drawn = renderer.draw_paths_to_intermediate(
+                    paths,
+                    writer,
+                    viewport,
+                    commands,
+                    &path_textures,
+                )?;
                 encoder = new_command_encoder_for_texture(commands, texture, viewport, None)?;
                 bind(&encoder, clips, &renderer.device);
                 if drawn {
-                    renderer.draw_paths_from_intermediate(paths, writer, viewport, &encoder)?;
+                    renderer.draw_paths_from_intermediate(
+                        paths,
+                        writer,
+                        viewport,
+                        &encoder,
+                        &path_textures,
+                    )?;
                 }
             }
             PrimitiveBatch::Surfaces(range) => renderer.draw_surfaces(

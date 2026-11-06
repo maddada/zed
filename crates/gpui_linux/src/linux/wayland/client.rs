@@ -93,7 +93,7 @@ use crate::linux::{
     keystroke_from_xkb, keystroke_underlying_dead_key, modifiers_from_xkb, new_xkb_context,
     open_uri_internal, read_fd_with_timeout, reveal_path_internal,
     wayland::{
-        clipboard::{Clipboard, DataOffer, FILE_LIST_MIME_TYPE, TEXT_MIME_TYPES},
+        clipboard::{Clipboard, DataOffer, FILE_LIST_MIME_TYPE, offered_mime_types},
         cursor::Cursor,
         serial::{ActivationContext, Serial, SerialKind, SerialTracker},
         to_shape,
@@ -1449,6 +1449,7 @@ impl WaylandConnection {
             return;
         };
         if state.mouse_focused_window.is_some() || state.keyboard_focused_window.is_some() {
+            let mime_types = offered_mime_types(&item);
             state.clipboard.set_primary(item);
             let Some(serial) = state.serial_tracker.selection_serial() else {
                 log::warn!(
@@ -1457,7 +1458,7 @@ impl WaylandConnection {
                 return;
             };
             let data_source = primary_selection_manager.create_source(&state.globals.qh, ());
-            for mime_type in TEXT_MIME_TYPES {
+            for mime_type in mime_types {
                 data_source.offer(mime_type.to_string());
             }
             data_source.offer(state.clipboard.self_mime());
@@ -1474,6 +1475,7 @@ impl WaylandConnection {
             return;
         };
         if state.mouse_focused_window.is_some() || state.keyboard_focused_window.is_some() {
+            let mime_types = offered_mime_types(&item);
             state.clipboard.set(item);
             let Some(serial) = state.serial_tracker.selection_serial() else {
                 log::warn!(
@@ -1483,7 +1485,7 @@ impl WaylandConnection {
             };
             let data_source = data_device_manager
                 .create_data_source(&state.globals.qh, DataSourceKind::Clipboard);
-            for mime_type in TEXT_MIME_TYPES {
+            for mime_type in mime_types {
                 data_source.offer(mime_type.to_string());
             }
             data_source.offer(state.clipboard.self_mime());
@@ -2204,10 +2206,16 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for WaylandClientStatePtr {
                                 }
 
                                 xkb::Status::Composed => {
-                                    state.pre_edit_text.take();
+                                    let had_pre_edit = state.pre_edit_text.take().is_some();
                                     keystroke.key_char = compose.utf8();
                                     if let Some(keysym) = compose.keysym() {
                                         keystroke.key = xkb::keysym_get_name(keysym);
+                                    }
+                                    // CDXC:PlatformSupport 2026-10-18 WHY: the dead key opened a preedit with SetMarkedText, and the composed character arrives as a plain KeyDown. A view that encodes keys itself (Ghostex's terminal) treats every key as part of a composition while marked text is set and dropped all input until focus loss cleared it (GitHub issue #256, dead keys on Fedora KDE). Close the preedit first, the way the focus-leave path does.
+                                    if had_pre_edit {
+                                        drop(state);
+                                        focused_window.handle_ime(ImeInput::DeleteText);
+                                        state = client.borrow_mut();
                                     }
                                 }
                                 xkb::Status::Cancelled => {
@@ -2329,6 +2337,8 @@ impl Dispatch<zwp_text_input_v3::ZwpTextInputV3, ()> for WaylandClientStatePtr {
                     // IBus Intercepts keys like `a`, `b`, but those keys are needed for vim mode.
                     // We should only send ASCII characters to Zed, otherwise a user could remap a letter like `か` or `相`.
                     if commit_text.len() == 1 {
+                        // The commit replaces the shown preedit; drop it before the synthetic KeyDown so a terminal does not swallow that key as part of the composition (see the compose path above).
+                        window.handle_ime(ImeInput::DeleteText);
                         window.handle_input(PlatformInput::KeyDown(KeyDownEvent {
                             keystroke: Keystroke {
                                 modifiers: Modifiers::default(),

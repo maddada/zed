@@ -64,6 +64,7 @@ objc2-metal = { version = "0.3.2", default-features = false, features = [
     "MTLRenderPass",
     "MTLRenderPipeline",
     "MTLResource",
+    "MTLSampler",
     "MTLTexture",
     "MTLTypes",
 ] }
