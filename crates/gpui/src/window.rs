@@ -6335,7 +6335,11 @@ impl Window {
                 | PlatformInput::Scroll(_)
                 | PlatformInput::Pinch(_)
                 | PlatformInput::FileDrop(_)
-        ) {
+        ) || matches!(&event, PlatformInput::Touch(touch) if touch.phase == crate::TouchPhase::Started)
+        {
+            // A finger coming down is a pointer in the window again: the
+            // gestures it makes (pans, taps, long presses) hit-test where it
+            // touched, even after the mouse last left the window.
             self.pointer_left_window = false;
             if matches!(
                 event,
@@ -10627,6 +10631,48 @@ mod tests {
         PreventDefault,
         StopPropagation,
         None,
+    }
+
+    struct ScrollTarget {
+        scrolls: Rc<Cell<usize>>,
+    }
+
+    impl Render for ScrollTarget {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            let scrolls = self.scrolls.clone();
+            div()
+                .size_full()
+                .on_scroll(move |_, _, _| scrolls.set(scrolls.get() + 1))
+        }
+    }
+
+    /// Browsers report a lifted finger as the pointer leaving the page; the
+    /// next touch must still pan the element under it.
+    #[gpui::test]
+    fn touch_pans_after_the_pointer_left_the_window(cx: &mut TestAppContext) {
+        let scrolls = Rc::new(Cell::new(0));
+        let window = cx.add_window({
+            let scrolls = scrolls.clone();
+            move |_, _| ScrollTarget { scrolls }
+        });
+        window
+            .update(cx, |_, window, cx| {
+                window.dispatch_event(
+                    PlatformInput::MouseExited(crate::MouseExitEvent {
+                        position: point(px(10.), px(0.)),
+                        pressed_button: None,
+                        modifiers: crate::Modifiers::default(),
+                    }),
+                    cx,
+                );
+            })
+            .unwrap();
+
+        dispatch_touch(window, cx, TouchId(1), TouchPhase::Started, 10.);
+        dispatch_touch(window, cx, TouchId(1), TouchPhase::Moved, 40.);
+        dispatch_touch(window, cx, TouchId(1), TouchPhase::Moved, 70.);
+
+        assert!(scrolls.get() > 0, "the pan reached no scroll listener");
     }
 
     struct LongPressListener {

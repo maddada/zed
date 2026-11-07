@@ -631,6 +631,16 @@ impl WebWindowInner {
         self.listen("pointerleave", move |event: JsValue| {
             let event: web_sys::PointerEvent = event.unchecked_into();
 
+            // Browsers fire `pointerleave` after every touch lifts (a finger
+            // has no hover). Reported as `MouseExited`, it left GPUI with no
+            // pointer in the window, so the next pan, fling step, tap and
+            // long press hit-tested against nothing: a phone could scroll
+            // once and never again, and couldn't select text. Touch input
+            // reaches GPUI through `TouchEvent`s only.
+            if event.pointer_type() == "touch" {
+                return;
+            }
+
             let position = pointer_position_in_element(&event);
             let modifiers = modifiers_from_mouse_event(&event, this.is_mac);
             let current_pressed = this.pressed_button.get();
