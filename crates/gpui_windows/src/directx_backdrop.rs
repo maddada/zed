@@ -13,10 +13,13 @@
 use std::{
     cell::RefCell,
     collections::HashMap,
-    path::{Path, PathBuf},
+    path::PathBuf,
     rc::{Rc, Weak},
     slice,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
     time::{Duration, Instant, SystemTime},
 };
 
@@ -38,7 +41,10 @@ use windows::{
             },
         },
         System::{
-            Com::{CLSCTX_ALL, CoCreateInstance, CoTaskMemFree},
+            Com::{
+                CLSCTX_ALL, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx, CoTaskMemFree,
+                CoUninitialize,
+            },
             Power::{GetSystemPowerStatus, SYSTEM_POWER_STATUS},
             Threading::GetCurrentProcessId,
         },
@@ -226,6 +232,8 @@ pub(crate) struct Backdrop {
     placement: Option<BackdropPlacement>,
     content: Option<Content>,
     loading: Option<(String, PictureSlot)>,
+    /// The monitor whose desktop wallpaper a worker is reading, and whether it has finished.
+    reading_wallpaper: Option<(Monitor, Arc<AtomicBool>)>,
     gpu: Option<BackdropGpu>,
     fade_started: Option<Instant>,
     /// Set when what is on screen no longer matches the content, placement or size.
@@ -247,6 +255,7 @@ impl Backdrop {
                 .as_ref()
                 .is_some_and(|live| draws_style(&live.style))
                 || self.loading.is_some()
+                || self.reading_wallpaper.is_some()
                 || matches!(self.content, Some(Content::Picture { .. })))
     }
 
@@ -299,6 +308,8 @@ impl Backdrop {
         if let Ok(mut cache) = PICTURE_CACHE.lock() {
             cache.clear();
         }
+        forget_wallpapers();
+        self.reading_wallpaper = None;
         self.resolve();
         self.dirty = true;
     }
@@ -318,11 +329,26 @@ impl Backdrop {
         let Some(placement) = self.placement else {
             return;
         };
-        let Some(source) = picture_source(
-            request.image.as_deref(),
-            &placement,
-            request.picture_blur_radius(),
-        ) else {
+        let picture = match request.image.as_deref() {
+            Some(image) => Some((image.to_path_buf(), PictureLayout::Cover, [0, 0, 0])),
+            None => match cached_wallpaper(placement.monitor) {
+                Some(wallpaper) => wallpaper,
+                None => {
+                    // Keeps what is on screen until the worker has read it.
+                    self.read_wallpaper(placement.monitor);
+                    return;
+                }
+            },
+        };
+        let Some(source) = picture.and_then(|(path, layout, background)| {
+            picture_source(
+                path,
+                layout,
+                background,
+                &placement,
+                request.picture_blur_radius(),
+            )
+        }) else {
             // A picture that cannot be read leaves the system's live blur, as on macOS.
             self.loading = None;
             self.set_content(None);
@@ -368,8 +394,55 @@ impl Backdrop {
         });
     }
 
-    /// Picks up a picture a worker finished blurring.
+    /// Starts a worker reading the desktop wallpaper of `monitor`, unless one already is.
+    ///
+    /// CDXC:Theming 2026-11-09: Ghostex #516 crashed at start on Windows with Glass set to
+    /// "Wallpaper only". `IDesktopWallpaper` lives in Explorer, so creating it from the UI thread
+    /// waits on a cross-process COM call that dispatches window messages; a paint dispatched in
+    /// that wait borrowed the renderer this backdrop belongs to while it was already borrowed
+    /// mutably, and panicked. The wallpaper is read on a worker in the multithreaded apartment,
+    /// whose COM calls block without dispatching messages, and kept per monitor until Windows
+    /// reports a new one; the UI thread never makes the call.
+    fn read_wallpaper(&mut self, monitor: Monitor) {
+        if self
+            .reading_wallpaper
+            .as_ref()
+            .is_some_and(|(reading, _)| *reading == monitor)
+        {
+            return;
+        }
+        let done = Arc::new(AtomicBool::new(false));
+        self.reading_wallpaper = Some((monitor, done.clone()));
+        let generation = WALLPAPER_GENERATION.load(Ordering::Acquire);
+        std::thread::spawn(move || {
+            let wallpaper = unsafe {
+                let initialized = CoInitializeEx(None, COINIT_MULTITHREADED).is_ok();
+                let wallpaper = desktop_wallpaper(monitor);
+                if initialized {
+                    CoUninitialize();
+                }
+                wallpaper
+            };
+            if let Ok(mut wallpapers) = WALLPAPERS.lock()
+                && WALLPAPER_GENERATION.load(Ordering::Acquire) == generation
+            {
+                wallpapers.retain(|(cached, _)| *cached != monitor);
+                wallpapers.push((monitor, wallpaper));
+            }
+            done.store(true, Ordering::Release);
+        });
+    }
+
+    /// Picks up a wallpaper or a picture a worker finished.
     fn poll_loading(&mut self) {
+        if self
+            .reading_wallpaper
+            .as_ref()
+            .is_some_and(|(_, done)| done.load(Ordering::Acquire))
+        {
+            self.reading_wallpaper = None;
+            self.resolve();
+        }
         let Some((key, slot)) = &self.loading else {
             return;
         };
@@ -426,7 +499,10 @@ impl Backdrop {
         if moving || fading || self.dirty {
             self.render(devices, composition, phase);
         }
-        self.loading.is_some() || self.fade_started.is_some() || (moving && self.is_live())
+        self.loading.is_some()
+            || self.reading_wallpaper.is_some()
+            || self.fade_started.is_some()
+            || (moving && self.is_live())
     }
 
     fn render(
@@ -1028,11 +1104,42 @@ fn cached_picture(key: &str) -> Option<Arc<BlurredPicture>> {
     })
 }
 
-/// The file the backdrop blurs by `radius` points and how it sits on the monitor: the app's
-/// picture filling the monitor, or the monitor's desktop wallpaper laid out the way Windows places
-/// it.
+/// A monitor's rectangle in device pixels.
+type Monitor = (i32, i32, i32, i32);
+
+/// A desktop wallpaper's file, placement and the colour around it.
+type Wallpaper = (PathBuf, PictureLayout, [u8; 3]);
+
+/// The desktop wallpaper read for each monitor (`None` when there is no picture to blur).
+static WALLPAPERS: Mutex<Vec<(Monitor, Option<Wallpaper>)>> = Mutex::new(Vec::new());
+
+/// Bumped when Windows reports a new wallpaper, so a read already running does not keep the old one.
+static WALLPAPER_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+/// The wallpaper read for `monitor`: `None` when it has not been read yet.
+fn cached_wallpaper(monitor: Monitor) -> Option<Option<Wallpaper>> {
+    WALLPAPERS.lock().ok().and_then(|wallpapers| {
+        wallpapers
+            .iter()
+            .find(|(cached, _)| *cached == monitor)
+            .map(|(_, wallpaper)| wallpaper.clone())
+    })
+}
+
+fn forget_wallpapers() {
+    WALLPAPER_GENERATION.fetch_add(1, Ordering::AcqRel);
+    if let Ok(mut wallpapers) = WALLPAPERS.lock() {
+        wallpapers.clear();
+    }
+}
+
+/// The picture at `path` laid out on the monitor the way `layout` places it, blurred by `radius`
+/// points: the app's picture filling the monitor, or the monitor's desktop wallpaper laid out the
+/// way Windows places it.
 fn picture_source(
-    image: Option<&Path>,
+    path: PathBuf,
+    layout: PictureLayout,
+    background: [u8; 3],
     placement: &BackdropPlacement,
     radius: f32,
 ) -> Option<PictureSource> {
@@ -1050,10 +1157,6 @@ fn picture_source(
         (radius * scale).round().max(1.0) as usize
     } else {
         0
-    };
-    let (path, layout, background) = match image {
-        Some(image) => (image.to_path_buf(), PictureLayout::Cover, [0, 0, 0]),
-        None => desktop_wallpaper(placement.monitor)?,
     };
     let modified = std::fs::metadata(&path)
         .and_then(|metadata| metadata.modified())
@@ -1079,7 +1182,8 @@ fn picture_source(
 
 /// The desktop wallpaper Windows shows on the monitor at `monitor`, its placement and the colour
 /// around it. `None` for a solid colour, a slideshow between pictures, or when it cannot be read.
-fn desktop_wallpaper(monitor: (i32, i32, i32, i32)) -> Option<(PathBuf, PictureLayout, [u8; 3])> {
+/// Makes a cross-process COM call, so it runs on `Backdrop::read_wallpaper`'s worker only.
+fn desktop_wallpaper(monitor: Monitor) -> Option<Wallpaper> {
     unsafe {
         let wallpaper: IDesktopWallpaper =
             CoCreateInstance(&DesktopWallpaper, None, CLSCTX_ALL).log_err()?;
