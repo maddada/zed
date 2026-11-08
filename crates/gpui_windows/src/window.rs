@@ -57,24 +57,44 @@ impl WindowsWindow {
 impl WindowsWindowInner {
     /// Ghostex: lays the backdrop out again after the window moved, resized or changed monitor.
     pub(crate) fn refresh_backdrop(&self) {
-        let Ok(mut renderer) = self.state.renderer.try_borrow_mut() else {
-            return;
+        let active = {
+            let Ok(mut renderer) = self.state.renderer.try_borrow_mut() else {
+                return;
+            };
+            let request = renderer.backdrop().request().clone();
+            if !request.blurred || !request.wallpaper {
+                return;
+            }
+            renderer.update_backdrop(request, placement_for(self.hwnd))
         };
-        let request = renderer.backdrop().request().clone();
-        if !request.blurred || !request.wallpaper {
-            return;
-        }
-        renderer.update_backdrop(request, placement_for(self.hwnd));
+        self.track_backdrop(active);
     }
 
     /// Ghostex: Windows reported a new desktop wallpaper.
     pub(crate) fn backdrop_wallpaper_changed(&self) {
-        let Ok(mut renderer) = self.state.renderer.try_borrow_mut() else {
-            return;
+        let active = {
+            let Ok(mut renderer) = self.state.renderer.try_borrow_mut() else {
+                return;
+            };
+            let request = renderer.backdrop().request();
+            if !request.blurred || !request.wallpaper || request.image.is_some() {
+                return;
+            }
+            renderer.backdrop_wallpaper_changed()
         };
-        let request = renderer.backdrop().request();
-        if request.blurred && request.wallpaper && request.image.is_none() {
-            renderer.backdrop_wallpaper_changed();
+        self.track_backdrop(active);
+    }
+
+    /// Ghostex: puts the window on the backdrop timer (or takes it off) after its backdrop changed.
+    ///
+    /// CDXC:Theming 2026-11-09: Windows testing of Ghostex #516 found a new desktop wallpaper
+    /// never reached an open window: the timer stops once a still picture is drawn, so nothing
+    /// picked up the wallpaper the worker read, and a window whose backdrop had nothing to show
+    /// when it was set up was never on the timer at all. Every backdrop change re-registers the
+    /// window, which also restarts the timer.
+    fn track_backdrop(&self, active: bool) {
+        if let Some(inner) = window_from_hwnd(self.hwnd) {
+            track_window(self.hwnd, Rc::downgrade(&inner), active);
         }
     }
 }

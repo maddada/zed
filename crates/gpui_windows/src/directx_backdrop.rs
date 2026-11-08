@@ -1568,10 +1568,11 @@ impl crate::DirectXRenderer {
         self.backdrop.is_active()
     }
 
-    /// The desktop wallpaper changed; re-reads it.
-    pub(crate) fn backdrop_wallpaper_changed(&mut self) {
+    /// The desktop wallpaper changed; re-reads it and returns whether the window has a backdrop.
+    pub(crate) fn backdrop_wallpaper_changed(&mut self) -> bool {
         self.backdrop.wallpaper_changed();
         self.redraw_backdrop();
+        self.backdrop.is_active()
     }
 
     /// Draws the backdrop again, after its device was rebuilt.
