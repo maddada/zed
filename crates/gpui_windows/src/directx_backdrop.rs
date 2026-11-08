@@ -53,7 +53,7 @@ use windows::{
             Shell::{DWPOS_FIT, DWPOS_STRETCH, DesktopWallpaper, IDesktopWallpaper},
             WindowsAndMessaging::{
                 GetClientRect, GetForegroundWindow, GetWindowThreadProcessId, IsIconic,
-                IsWindowVisible, KillTimer, SPI_GETCLIENTAREAANIMATION,
+                IsWindowVisible, KillTimer, SPI_GETCLIENTAREAANIMATION, SPI_GETDESKWALLPAPER,
                 SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SetTimer, SystemParametersInfoW,
             },
         },
@@ -1185,6 +1185,20 @@ fn picture_source(
 /// Makes a cross-process COM call, so it runs on `Backdrop::read_wallpaper`'s worker only.
 fn desktop_wallpaper(monitor: Monitor) -> Option<Wallpaper> {
     unsafe {
+        // CDXC:Theming 2026-11-09: Windows testing of Ghostex #516 found a window started while
+        // the desktop was a solid colour blurred an old picture: `IDesktopWallpaper` still names
+        // the last picture (img0.jpg) after the background was switched to a solid colour, while
+        // the desktop's own wallpaper setting is empty. An empty setting means no picture.
+        let mut current = [0u16; 260];
+        let read = SystemParametersInfoW(
+            SPI_GETDESKWALLPAPER,
+            current.len() as u32,
+            Some(current.as_mut_ptr().cast()),
+            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+        );
+        if read.is_ok() && current[0] == 0 {
+            return None;
+        }
         let wallpaper: IDesktopWallpaper =
             CoCreateInstance(&DesktopWallpaper, None, CLSCTX_ALL).log_err()?;
         let count = wallpaper.GetMonitorDevicePathCount().log_err()?;
