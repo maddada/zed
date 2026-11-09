@@ -434,10 +434,19 @@ impl WgpuRenderer {
                     })
             };
 
-        let transparent_alpha_mode = pick_alpha_mode(&[
-            wgpu::CompositeAlphaMode::PreMultiplied,
-            wgpu::CompositeAlphaMode::Inherit,
-        ])?;
+        // Ghostex: wgpu's WebGPU backend lists only `Opaque` in a canvas's capabilities, though the
+        // browser canvas takes `premultiplied` (and wgpu configures it). Picking from the list made
+        // every web overlay window (a menu, a dialog) an opaque canvas, so whatever it left
+        // unpainted showed as black: a dialog laid over the whole chat blacked the chat out.
+        let transparent_alpha_mode =
+            if adapter.get_info().backend == wgpu::Backend::BrowserWebGpu {
+                wgpu::CompositeAlphaMode::PreMultiplied
+            } else {
+                pick_alpha_mode(&[
+                    wgpu::CompositeAlphaMode::PreMultiplied,
+                    wgpu::CompositeAlphaMode::Inherit,
+                ])?
+            };
 
         let opaque_alpha_mode = pick_alpha_mode(&[
             wgpu::CompositeAlphaMode::Opaque,
