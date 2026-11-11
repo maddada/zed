@@ -12,7 +12,7 @@ use windows::Win32::{
             SetClipboardData,
         },
         Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock},
-        Ole::{CF_DIB, CF_HDROP, CF_UNICODETEXT},
+        Ole::{CF_DIB, CF_DIBV5, CF_HDROP, CF_UNICODETEXT},
     },
     UI::Shell::{DragQueryFileW, HDROP},
 };
@@ -197,6 +197,16 @@ fn write_string(item: &ClipboardString) -> Result<()> {
     Ok(())
 }
 
+/// CDXC:Clipboard 2026-11-11 WHY: Windows apps read pictures from bitmaps. Copy image in
+/// Ghostex's picture viewers put only the registered "PNG" format on the clipboard, which
+/// browsers, Office, Slack and GPUI itself read, but Paint, PowerShell's `Get-Clipboard -Format
+/// Image`, Win+V history and most native apps read only CF_DIB / CF_BITMAP, so for them nothing
+/// had been copied (user, on Windows: "the copy image button does nothing"). A raster image now
+/// goes on as its own format, as "PNG" (keeps transparency where apps read it), as CF_DIB (24-bit,
+/// transparent pixels laid on white, so apps that drop alpha show no black background; Windows
+/// makes CF_BITMAP from it) and as CF_DIBV5 (32-bit with straight alpha). Its own format and PNG
+/// come first, so GPUI's own paste, which takes the first image format it knows, reads what it
+/// read before.
 fn write_image(item: &Image) -> Result<()> {
     let native_format = match item.format {
         ImageFormat::Svg => Some(*CLIPBOARD_SVG_FORMAT),
@@ -209,27 +219,101 @@ fn write_image(item: &Image) -> Result<()> {
         set_clipboard_bytes(item.bytes(), format)?;
     }
 
-    // Also provide a PNG copy for broad compatibility.
-    // SVG can't be rasterized by the image crate, so skip it.
-    if item.format != ImageFormat::Svg && native_format != Some(*CLIPBOARD_PNG_FORMAT) {
-        if let Some(png_bytes) = convert_to_png(item.bytes(), item.format) {
+    // SVG can't be rasterized by the image crate, so it goes on as SVG only.
+    if item.format == ImageFormat::Svg {
+        return Ok(());
+    }
+    let Some(pixels) = decode_rgba(item.bytes(), item.format) else {
+        return Ok(());
+    };
+    if native_format != Some(*CLIPBOARD_PNG_FORMAT) {
+        if let Some(png_bytes) = encode_png(&pixels) {
             set_clipboard_bytes(&png_bytes, *CLIPBOARD_PNG_FORMAT)?;
         }
     }
+    set_clipboard_bytes(&dib_on_white(&pixels), CF_DIB.0 as u32)?;
+    set_clipboard_bytes(&dib_v5(&pixels), CF_DIBV5.0 as u32)?;
     Ok(())
 }
 
-fn convert_to_png(bytes: &[u8], format: ImageFormat) -> Option<Vec<u8>> {
+fn decode_rgba(bytes: &[u8], format: ImageFormat) -> Option<image::RgbaImage> {
     let img_format = gpui_to_image_format(format)?;
     let image = image::load_from_memory_with_format(bytes, img_format)
-        .map_err(|e| log::warn!("Failed to decode image for PNG conversion: {e}"))
+        .map_err(|e| log::warn!("Failed to decode image for the clipboard: {e}"))
         .ok()?;
+    let pixels = image.to_rgba8();
+    (pixels.width() > 0 && pixels.height() > 0).then_some(pixels)
+}
+
+fn encode_png(pixels: &image::RgbaImage) -> Option<Vec<u8>> {
     let mut buf = Vec::new();
-    image
+    pixels
         .write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png)
         .map_err(|e| log::warn!("Failed to encode PNG: {e}"))
         .ok()?;
     Some(buf)
+}
+
+/// A packed CF_DIB: a BITMAPINFOHEADER and 24-bit bottom-up BGR rows padded to 4 bytes, with
+/// every pixel blended over white by its alpha.
+fn dib_on_white(pixels: &image::RgbaImage) -> Vec<u8> {
+    let (width, height) = pixels.dimensions();
+    let stride = (width as usize * 3).div_ceil(4) * 4;
+    let image_size = stride * height as usize;
+    let mut dib = Vec::with_capacity(40 + image_size);
+    dib.extend_from_slice(&40u32.to_le_bytes()); // biSize
+    dib.extend_from_slice(&(width as i32).to_le_bytes());
+    dib.extend_from_slice(&(height as i32).to_le_bytes()); // positive: bottom-up
+    dib.extend_from_slice(&1u16.to_le_bytes()); // biPlanes
+    dib.extend_from_slice(&24u16.to_le_bytes()); // biBitCount
+    dib.extend_from_slice(&0u32.to_le_bytes()); // BI_RGB
+    dib.extend_from_slice(&(image_size as u32).to_le_bytes());
+    dib.extend_from_slice(&[0u8; 16]); // resolution and palette counts
+    for row in pixels.rows().rev() {
+        let start = dib.len();
+        for pixel in row {
+            let [r, g, b, a] = pixel.0;
+            let over_white = |channel: u8| {
+                ((channel as u32 * a as u32 + 255 * (255 - a as u32) + 127) / 255) as u8
+            };
+            dib.extend_from_slice(&[over_white(b), over_white(g), over_white(r)]);
+        }
+        dib.resize(start + stride, 0);
+    }
+    dib
+}
+
+/// A packed CF_DIBV5: a BITMAPV5HEADER (sRGB, BI_BITFIELDS with an alpha mask) and 32-bit
+/// bottom-up BGRA rows with straight alpha.
+fn dib_v5(pixels: &image::RgbaImage) -> Vec<u8> {
+    const LCS_SRGB: u32 = 0x7352_4742;
+    const LCS_GM_IMAGES: u32 = 4;
+    let (width, height) = pixels.dimensions();
+    let image_size = width as usize * height as usize * 4;
+    let mut dib = Vec::with_capacity(124 + image_size);
+    dib.extend_from_slice(&124u32.to_le_bytes()); // bV5Size
+    dib.extend_from_slice(&(width as i32).to_le_bytes());
+    dib.extend_from_slice(&(height as i32).to_le_bytes()); // positive: bottom-up
+    dib.extend_from_slice(&1u16.to_le_bytes()); // bV5Planes
+    dib.extend_from_slice(&32u16.to_le_bytes()); // bV5BitCount
+    dib.extend_from_slice(&3u32.to_le_bytes()); // BI_BITFIELDS
+    dib.extend_from_slice(&(image_size as u32).to_le_bytes());
+    dib.extend_from_slice(&[0u8; 16]); // resolution and palette counts
+    for mask in [0x00FF_0000u32, 0x0000_FF00, 0x0000_00FF, 0xFF00_0000] {
+        dib.extend_from_slice(&mask.to_le_bytes());
+    }
+    dib.extend_from_slice(&LCS_SRGB.to_le_bytes());
+    dib.extend_from_slice(&[0u8; 36 + 12]); // endpoints and gamma, unused for sRGB
+    dib.extend_from_slice(&LCS_GM_IMAGES.to_le_bytes());
+    dib.extend_from_slice(&[0u8; 12]); // profile data, profile size, reserved
+    debug_assert_eq!(dib.len(), 124);
+    for row in pixels.rows().rev() {
+        for pixel in row {
+            let [r, g, b, a] = pixel.0;
+            dib.extend_from_slice(&[b, g, r, a]);
+        }
+    }
+    dib
 }
 
 fn read_string() -> Option<ClipboardEntry> {
@@ -291,8 +375,10 @@ fn convert_dib_to_bmp(dib: &[u8]) -> Option<Vec<u8>> {
         } else {
             colors_used
         }) * 4
-    } else if compression == 3 {
-        12 // BI_BITFIELDS
+    } else if compression == 3 && header_size == 40 {
+        // BI_BITFIELDS: the three masks follow a BITMAPINFOHEADER; a V4 or V5 header holds
+        // them itself.
+        12
     } else {
         0
     };
@@ -343,12 +429,24 @@ fn gpui_to_image_format(value: ImageFormat) -> Option<image::ImageFormat> {
 struct ClipboardGuard;
 
 impl ClipboardGuard {
+    /// CDXC:Clipboard 2026-11-11 WHY: another program (a clipboard manager, Win+V history, a
+    /// remote desktop client) can hold the clipboard for a moment, often right after the copy
+    /// before it, and a single failed `OpenClipboard` dropped the copy without a trace. Retry
+    /// briefly, as other Windows clipboard libraries do, before giving up.
     fn open() -> Option<Self> {
-        match unsafe { OpenClipboard(None) } {
-            Ok(()) => Some(Self),
-            Err(e) => {
-                log::error!("Failed to open clipboard: {e}");
-                None
+        const ATTEMPTS: u32 = 10;
+        let mut attempt = 1;
+        loop {
+            match unsafe { OpenClipboard(None) } {
+                Ok(()) => return Some(Self),
+                Err(e) if attempt >= ATTEMPTS => {
+                    log::error!("Failed to open clipboard: {e}");
+                    return None;
+                }
+                Err(_) => {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                    attempt += 1;
+                }
             }
         }
     }
