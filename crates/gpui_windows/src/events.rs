@@ -241,6 +241,10 @@ impl WindowsWindowInner {
             self.state
                 .restore_from_minimized
                 .set(self.state.callbacks.request_frame.take());
+            // Ghostex: a minimized window keeps no scroll layer tiles; the first frame after the
+            // restore builds them again, as after a DPI change (macOS frees them for any window
+            // nobody can see, `release_hidden_window_resources`).
+            crate::fast::layers::release_tiles(&mut self.state.renderer.borrow_mut());
             return Some(0);
         }
 

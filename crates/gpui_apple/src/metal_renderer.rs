@@ -580,6 +580,15 @@ impl MetalRenderer {
         self.path_intermediate_msaa_texture = None;
     }
 
+    /// Ghostex: frees what a window nobody can see keeps for its next frame: the window-sized path
+    /// textures and the scroll layer tiles (up to `DEFAULT_BUDGET_BYTES`, GPU-private memory).
+    /// The next frame rebuilds both as it does after a resize. Hidden windows the app keeps for
+    /// reuse (menus, tooltips, popups) otherwise held their tiles for as long as the app ran.
+    pub fn release_hidden_window_resources(&mut self) {
+        self.release_window_path_textures();
+        crate::fast::layers::TileCache::clear(&mut self.fast_layers);
+    }
+
     /// Ghostex: allocates the window's path textures at `size` unless they already have it.
     /// Called by a frame that draws paths, before it rasterizes them.
     pub(crate) fn ensure_window_path_textures(&mut self, size: Size<DevicePixels>) -> Result<()> {

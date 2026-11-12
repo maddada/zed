@@ -3821,9 +3821,9 @@ extern "C" fn window_did_change_occlusion_state(this: &AnyObject, _: Sel, _: *mu
         lock.start_display_link(&window_state);
     } else {
         lock.stop_display_link();
-        // Ghostex: a window nobody can see keeps no window-sized path textures; the next
-        // frame that draws a path allocates them again.
-        lock.renderer.release_window_path_textures();
+        // Ghostex: a window nobody can see keeps no window-sized path textures and no scroll
+        // layer tiles; the next frame that needs them builds them again.
+        lock.renderer.release_hidden_window_resources();
     }
     drop(lock);
     // The only visibility source: AppKit posts this for covering, minimizing,
