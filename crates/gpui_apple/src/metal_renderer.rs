@@ -75,16 +75,26 @@ pub fn new_overlay_renderer(context: self::Context, base: &Renderer) -> Result<R
 /// the GPU has read them.
 pub(crate) type SurfaceTextures = Vec<CFRetained<CVMetalTexture>>;
 
+/// The size instance buffers start at, and the smallest one a shrink goes back to.
+const MIN_INSTANCE_BUFFER_SIZE: usize = 2 * 1024 * 1024;
+/// How long the pool watches frames before it may shrink its buffers.
+const INSTANCE_BUFFER_SHRINK_WINDOW: std::time::Duration = std::time::Duration::from_secs(10);
+
 pub struct InstanceBufferPool {
     buffer_size: usize,
     buffers: Vec<InstanceBuffer>,
+    /// The most instance bytes one frame wrote since `window_started`.
+    window_peak: usize,
+    window_started: std::time::Instant,
 }
 
 impl Default for InstanceBufferPool {
     fn default() -> Self {
         Self {
-            buffer_size: 2 * 1024 * 1024,
+            buffer_size: MIN_INSTANCE_BUFFER_SIZE,
             buffers: Vec::new(),
+            window_peak: 0,
+            window_started: std::time::Instant::now(),
         }
     }
 }
@@ -131,6 +141,35 @@ impl InstanceBufferPool {
     pub(crate) fn release(&mut self, buffer: InstanceBuffer) {
         if buffer.size == self.buffer_size {
             self.buffers.push(buffer)
+        }
+    }
+
+    /// Ghostex: notes the instance bytes one frame wrote, and shrinks the buffers once the busiest
+    /// frame of the last `INSTANCE_BUFFER_SHRINK_WINDOW` used at most a quarter of them.
+    ///
+    /// The pool only ever grew: one heavy frame (a long chat transcript scrolled in one go) raised
+    /// every pooled buffer, shared by all windows, to as much as `MAX_INSTANCE_BUFFER_SIZE` for as
+    /// long as the app ran. The new size is twice that peak (at least `MIN_INSTANCE_BUFFER_SIZE`),
+    /// so a frame like the busiest one still fits in one buffer, and a heavier one grows the pool
+    /// again mid-frame as before. Buffers of the old size still in flight are dropped when their
+    /// frame returns them (`release`).
+    pub(crate) fn note_frame_bytes(&mut self, bytes: usize) {
+        self.window_peak = self.window_peak.max(bytes);
+        if self.window_started.elapsed() < INSTANCE_BUFFER_SHRINK_WINDOW {
+            return;
+        }
+        let peak = std::mem::take(&mut self.window_peak);
+        self.window_started = std::time::Instant::now();
+        if peak.saturating_mul(4) > self.buffer_size {
+            return;
+        }
+        let target = peak
+            .saturating_mul(2)
+            .next_power_of_two()
+            .max(MIN_INSTANCE_BUFFER_SIZE);
+        if target < self.buffer_size {
+            log::info!("decreased instance buffer size to {target}");
+            self.reset(target);
         }
     }
 }
@@ -2449,7 +2488,9 @@ impl InstanceBufferWriter {
 
     fn grow(&mut self, required: usize) -> Result<()> {
         let mut pool = self.pool.lock();
-        let buffer_size = (pool.buffer_size * 2)
+        // From this frame's own buffer too: another window's frame may have shrunk the pool
+        // (`note_frame_bytes`) while this one held a bigger buffer.
+        let buffer_size = (pool.buffer_size.max(self.current.size) * 2)
             .max(required.next_power_of_two())
             .min(MAX_INSTANCE_BUFFER_SIZE);
         anyhow::ensure!(
@@ -2475,6 +2516,7 @@ impl InstanceBufferWriter {
 
     pub(crate) fn finish(self) -> InstanceBuffer {
         let Self {
+            pool,
             unified_memory,
             filled,
             current,
@@ -2500,6 +2542,8 @@ impl InstanceBufferWriter {
             }
         }
 
+        let written = filled.iter().map(|(_, written)| *written).sum::<usize>() + offset;
+        pool.lock().note_frame_bytes(written);
         // Metal retains encoded resources until the command buffer completes.
         // Only the final, largest buffer is worth keeping in the pool.
         drop(filled);
