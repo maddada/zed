@@ -306,6 +306,8 @@ pub struct X11WindowState {
     background_appearance: WindowBackgroundAppearance,
     maximized_vertical: bool,
     maximized_horizontal: bool,
+    /// What Hyprland says about the window that its X11 properties don't carry.
+    hyprland: HyprlandWindowState,
     hidden: bool,
     active: bool,
     /// Owned by the client's `WindowRef`, which combines the mapped state with
@@ -1012,6 +1014,7 @@ impl X11WindowState {
                 fullscreen: false,
                 maximized_vertical: false,
                 maximized_horizontal: false,
+                hyprland: HyprlandWindowState::default(),
                 hidden: false,
                 appearance,
                 handle,
@@ -1048,6 +1051,29 @@ impl X11WindowState {
 #[cfg(target_os = "linux")]
 fn app_frame_needs_holding_on_hyprland() -> bool {
     std::env::var_os("HYPRLAND_INSTANCE_SIGNATURE").is_some()
+}
+
+/// CDXC:PlatformSupport 2026-11-15 WHY:
+/// Hyprland's maximize (`zoom` there, Omarchy's titlebar `□`, a key binding) sets no `_NET_WM_STATE` on an X11 window, so `is_maximized` was always false and Ghostex's maximize button never turned into Restore. On Hyprland the state is asked of Hyprland itself: after each resize, since maximizing and restoring a floating window resize it, and after the window's own `zoom`, which a lone tiled window survives at the same size; for the window's address, which is learnt the first time the window draws while it is Hyprland's active window.
+#[cfg(target_os = "linux")]
+impl X11WindowStatePtr {
+    fn hyprland_maximized(&self) -> bool {
+        let state = self.state.borrow();
+        let hyprland = &state.hyprland;
+        if let Some(maximized) = hyprland.maximized.get() {
+            return maximized;
+        }
+        if hyprland.address.borrow().is_none() && state.active && !hyprland.address_asked.get() {
+            hyprland.address_asked.set(true);
+            *hyprland.address.borrow_mut() = hyprland_active_window_address(&state.glass.title);
+        }
+        let Some(address) = hyprland.address.borrow().clone() else {
+            return false;
+        };
+        let maximized = hyprland_window_maximized(&address).unwrap_or(false);
+        hyprland.maximized.set(Some(maximized));
+        maximized
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -1132,6 +1158,18 @@ struct ClientMove {
     hyprland: Option<std::sync::mpsc::Sender<Point<i32>>>,
 }
 
+/// What Hyprland says about a window that its X11 properties don't carry, read on demand. The
+/// cells let `is_maximized` fill it in under the shared borrow `window_bounds` holds.
+#[derive(Default)]
+struct HyprlandWindowState {
+    /// The window's Hyprland address, learnt while it is Hyprland's active window.
+    address: RefCell<Option<String>>,
+    /// The address was asked for since the window last took focus.
+    address_asked: std::cell::Cell<bool>,
+    /// Hyprland's maximize, asked again after each resize.
+    maximized: std::cell::Cell<Option<bool>>,
+}
+
 /// The window being moved as Hyprland knows it: its address, its top-left corner in Hyprland's
 /// logical coordinates and the scale of its monitor, from logical to X pixels.
 #[cfg(target_os = "linux")]
@@ -1179,22 +1217,84 @@ fn start_hyprland_move() -> Option<std::sync::mpsc::Sender<Point<i32>>> {
 /// CDXC:PlatformSupport 2026-11-14 DECISION:
 /// User: "make double clicking titlebar on omarchy full screen the app (regular full screen like pressing maximise button in the new floating titlebar in omarchy 4.5)". Omarchy's window rules give every window `suppress_event = "maximize"`, so the `_NET_WM_STATE` maximize request `zoom` sends elsewhere was dropped and a double-click on a drag strip did nothing. On Hyprland `zoom` sends what Omarchy's titlebar maximize button and its double-click send (workspace-modes.lua): `hl.dsp.window.fullscreen({ mode = "maximized", action = "toggle" })` for the window, which a second double-click undoes; an older Hyprland gets `fullscreen 1`, the same toggle for its active window. The window is Hyprland's active window, which the double-click made it, checked against this process's id.
 #[cfg(target_os = "linux")]
-fn toggle_hyprland_maximize() {
+fn toggle_hyprland_maximize(address: Option<String>) {
+    // A window that knows its address (`X11WindowStatePtr::hyprland_maximized`) is toggled at
+    // once, so the next frame already reads the new state; a single tiled window keeps its size
+    // when maximized, which leaves no resize to refresh it from.
+    if let Some(address) = address {
+        send_hyprland_maximize_toggle(&address);
+        return;
+    }
     std::thread::Builder::new()
         .name("hyprland-maximize".into())
         .spawn(|| {
             let Some(window) = hyprland_active_window() else {
                 return;
             };
-            let address = window.address;
-            let lua = format!(
-                r#"dispatch hl.dsp.window.fullscreen({{ mode = "maximized", action = "toggle", window = "address:{address}" }})"#
-            );
-            if !hyprland_request(&lua).is_some_and(|answer| answer.trim() == "ok") {
-                hyprland_request("dispatch fullscreen 1");
-            }
+            send_hyprland_maximize_toggle(&window.address);
         })
         .log_err();
+}
+
+#[cfg(target_os = "linux")]
+fn send_hyprland_maximize_toggle(address: &str) {
+    let lua = format!(
+        r#"dispatch hl.dsp.window.fullscreen({{ mode = "maximized", action = "toggle", window = "address:{address}" }})"#
+    );
+    if !hyprland_request(&lua).is_some_and(|answer| answer.trim() == "ok") {
+        hyprland_request("dispatch fullscreen 1");
+    }
+}
+
+/// Omarchy's minimize, which its floating workspaces' titlebar `−` and Super+M run.
+#[cfg(target_os = "linux")]
+const OMARCHY_MINIMIZE_COMMAND: &str = "omarchy-hyprland-window-minimize";
+
+/// CDXC:PlatformSupport 2026-11-15 WHY:
+/// Ghostex shows a minimize button on Hyprland (user, 2026-11-15: "please on arch show the close/minimize/maximise buttons on the top right like on windows"), but Hyprland has no minimize of its own: it ignores the ICCCM iconify request `minimize` sends elsewhere (the window stays on its workspace). On Hyprland `minimize` runs Omarchy's minimize for the window instead, which moves it to Omarchy's hidden minimized workspace, from where Omarchy's dock brings it back; Omarchy minimizes only on its floating workspaces, the ones the dock shows on, and leaves the window where it is on any other. Ghostex shows its minimize button only where that command exists (apps/desktop/src/linux_hyprland.rs). The window is Hyprland's active window, which the click on the button made it, checked against this process's id.
+#[cfg(target_os = "linux")]
+fn minimize_on_hyprland() {
+    std::thread::Builder::new()
+        .name("hyprland-minimize".into())
+        .spawn(|| {
+            let Some(window) = hyprland_active_window() else {
+                return;
+            };
+            std::process::Command::new(OMARCHY_MINIMIZE_COMMAND)
+                .arg(&window.address)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .log_err();
+        })
+        .log_err();
+}
+
+/// The address of Hyprland's active window when it is this process's window titled `title` (any
+/// title when empty).
+#[cfg(target_os = "linux")]
+fn hyprland_active_window_address(title: &str) -> Option<String> {
+    let window: serde_json::Value =
+        serde_json::from_str(&hyprland_request("j/activewindow")?).ok()?;
+    if window.get("pid")?.as_u64()? != u64::from(std::process::id()) {
+        return None;
+    }
+    if !title.is_empty() && window.get("title")?.as_str()? != title {
+        return None;
+    }
+    Some(window.get("address")?.as_str()?.to_string())
+}
+
+/// Whether Hyprland has the window at `address` maximized (its fullscreen mode 1, which Omarchy's
+/// maximize and `zoom` set); `None` when Hyprland doesn't answer or no longer knows the window.
+#[cfg(target_os = "linux")]
+fn hyprland_window_maximized(address: &str) -> Option<bool> {
+    let clients: serde_json::Value = serde_json::from_str(&hyprland_request("j/clients")?).ok()?;
+    let window = clients.as_array()?.iter().find(|client| {
+        client.get("address").and_then(serde_json::Value::as_str) == Some(address)
+    })?;
+    Some(window.get("fullscreen")?.as_i64()? == 1)
 }
 
 /// Moves the window to `to` in Hyprland's logical coordinates, in its Lua dispatch (0.56 and
@@ -1694,6 +1794,7 @@ impl X11WindowStatePtr {
         // the client, and focus is the conventional means for the user to zero it.
         if state.active && !was_active {
             set_wm_hints_urgency(&self.xcb, self.x_window, false);
+            state.hyprland.address_asked.set(false);
         }
 
         Ok(())
@@ -1868,6 +1969,7 @@ impl X11WindowStatePtr {
             // because it contains wrong values.
             if is_resize {
                 state.bounds.size = bounds.size;
+                state.hyprland.maximized.set(None);
                 // CDXC:PlatformSupport 2026-09-29 WHY:
                 // Keeping the old origin on a resize left `bounds()` at the requested position after the window manager grew a client-decorated window by its `_GTK_FRAME_EXTENTS` and moved it out by the inset, while a later move reported the real one. The two differ by the inset, so a saved and restored window shifted on every launch. The real position is read from the server instead.
                 if let Some(position) = get_reply(
@@ -1973,6 +2075,10 @@ impl PlatformWindow for X11Window {
     }
 
     fn is_maximized(&self) -> bool {
+        #[cfg(target_os = "linux")]
+        if window_manager_ignores_moveresize() {
+            return self.0.hyprland_maximized();
+        }
         let state = self.0.state.borrow();
 
         // A maximized window that gets minimized will still retain its maximized state.
@@ -2371,6 +2477,11 @@ impl PlatformWindow for X11Window {
     }
 
     fn minimize(&self) {
+        #[cfg(target_os = "linux")]
+        if window_manager_ignores_moveresize() {
+            minimize_on_hyprland();
+            return;
+        }
         let state = self.0.state.borrow();
         const WINDOW_ICONIC_STATE: u32 = 3;
         let message = ClientMessageEvent::new(
@@ -2394,7 +2505,10 @@ impl PlatformWindow for X11Window {
     fn zoom(&self) {
         #[cfg(target_os = "linux")]
         if window_manager_ignores_moveresize() {
-            toggle_hyprland_maximize();
+            let state = self.0.state.borrow();
+            let address = state.hyprland.address.borrow().clone();
+            toggle_hyprland_maximize(address);
+            state.hyprland.maximized.set(None);
             return;
         }
         let state = self.0.state.borrow();
