@@ -1369,6 +1369,10 @@ impl X11Client {
                 let window = self
                     .get_window(event.event)
                     .or_else(|| crate::fast::composition::x11::pointer_window(event.event))?;
+                #[cfg(target_os = "linux")]
+                if event.detail == 1 {
+                    window.end_client_move();
+                }
                 let mut state = self.0.borrow_mut();
                 let modifiers = modifiers_from_xinput_info(event.mods);
                 state.modifiers = modifiers;
@@ -1401,6 +1405,16 @@ impl X11Client {
                 let window = self
                     .get_window(event.event)
                     .or_else(|| crate::fast::composition::x11::pointer_window(event.event))?;
+                // A move the window does itself (x11/window.rs `start_client_move`) takes the motion
+                // until the left button is up; a release it never saw ends it here.
+                #[cfg(target_os = "linux")]
+                if pressed_button_from_mask(event.button_mask[0]) == Some(MouseButton::Left) {
+                    if window.continue_client_move(event.root_x >> 16, event.root_y >> 16) {
+                        return Some(());
+                    }
+                } else {
+                    window.end_client_move();
+                }
                 let mut state = self.0.borrow_mut();
                 state.restore_cursor_after_hide();
                 if window.is_blocked() {

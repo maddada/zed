@@ -278,6 +278,10 @@ pub struct X11WindowState {
     app_frame_held_until: Option<std::time::Instant>,
     #[cfg(target_os = "linux")]
     app_frame_restores: u8,
+    /// A window move the app is doing itself because the window manager ignores
+    /// `_NET_WM_MOVERESIZE` (`start_client_move`).
+    #[cfg(target_os = "linux")]
+    client_move: Option<ClientMove>,
     #[cfg(target_os = "linux")]
     owned_children: FxHashSet<xproto::Window>,
     children: FxHashSet<xproto::Window>,
@@ -975,6 +979,8 @@ impl X11WindowState {
                 #[cfg(target_os = "linux")]
                 app_frame_restores: 0,
                 #[cfg(target_os = "linux")]
+                client_move: None,
+                #[cfg(target_os = "linux")]
                 owned_children: FxHashSet::default(),
                 parent,
                 keyboard_focus_window,
@@ -1111,6 +1117,76 @@ impl X11WindowStatePtr {
         if let Some(frame) = self.state.borrow_mut().app_frame.as_mut() {
             frame.origin = Point { x, y };
         }
+    }
+}
+
+/// Where the pointer and the window's top-left corner were, in root device pixels, when a move
+/// the app does itself started.
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy)]
+struct ClientMove {
+    pointer: Point<i32>,
+    origin: Point<i32>,
+}
+
+/// CDXC:PlatformSupport 2026-11-14 WHY:
+/// On Omarchy a Ghostex window without a title bar (the page window a `ghostex show` card opens, the app modals) could not be dragged by its top band: Hyprland's XWayland window manager lists `_NET_WM_MOVERESIZE` as supported but drops the message (0.56 `CXWM::handleClientMessage` handles only `_NET_WM_STATE`, `WM_CHANGE_STATE`, `_NET_ACTIVE_WINDOW` and the Wayland and drag-and-drop messages), so `start_window_move` asked for a move nobody made. On Hyprland the window moves itself instead: it keeps the press's pointer grab, follows the pointer with ConfigureWindow, which Hyprland applies to a floating window, and stops at the release. Other window managers still get `_NET_WM_MOVERESIZE`.
+#[cfg(target_os = "linux")]
+fn window_manager_ignores_moveresize() -> bool {
+    app_frame_needs_holding_on_hyprland()
+}
+
+#[cfg(target_os = "linux")]
+impl X11WindowStatePtr {
+    /// Starts a move the app does itself (`window_manager_ignores_moveresize`) from where the
+    /// pointer and the window are now.
+    fn start_client_move(&self) -> anyhow::Result<()> {
+        let x_root_window = self.state.borrow().x_root_window;
+        let pointer = get_reply(
+            || "X11 QueryPointer before moving the window failed.",
+            self.xcb.query_pointer(self.x_window),
+        )?;
+        let origin = get_reply(
+            || "X11 TranslateCoordinates before moving the window failed.",
+            self.xcb
+                .translate_coordinates(self.x_window, x_root_window, 0, 0),
+        )?;
+        self.state.borrow_mut().client_move = Some(ClientMove {
+            pointer: Point {
+                x: pointer.root_x as i32,
+                y: pointer.root_y as i32,
+            },
+            origin: Point {
+                x: origin.dst_x as i32,
+                y: origin.dst_y as i32,
+            },
+        });
+        Ok(())
+    }
+
+    /// Follows the pointer, at root position `root_x`, `root_y`, during a move the app does
+    /// itself; false when there is none, so the motion is the app's.
+    pub(crate) fn continue_client_move(&self, root_x: i32, root_y: i32) -> bool {
+        let Some(moving) = self.state.borrow().client_move else {
+            return false;
+        };
+        let x = moving.origin.x + root_x - moving.pointer.x;
+        let y = moving.origin.y + root_y - moving.pointer.y;
+        check_reply(
+            || "X11 ConfigureWindow moving the window failed.",
+            self.xcb
+                .configure_window(self.x_window, &xproto::ConfigureWindowAux::new().x(x).y(y)),
+        )
+        .log_err();
+        xcb_flush(&self.xcb);
+        // A move in the moments after the window opened is the user's, not one to undo.
+        self.set_app_frame_origin(x, y);
+        true
+    }
+
+    /// Ends a move the app does itself; true when one was running.
+    pub(crate) fn end_client_move(&self) -> bool {
+        self.state.borrow_mut().client_move.take().is_some()
     }
 }
 
@@ -2340,6 +2416,11 @@ impl PlatformWindow for X11Window {
     }
 
     fn start_window_move(&self) {
+        #[cfg(target_os = "linux")]
+        if window_manager_ignores_moveresize() {
+            self.0.start_client_move().log_err();
+            return;
+        }
         const MOVERESIZE_MOVE: u32 = 8;
         self.send_moveresize(MOVERESIZE_MOVE).log_err();
     }
