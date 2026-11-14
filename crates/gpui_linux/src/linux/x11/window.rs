@@ -1176,6 +1176,27 @@ fn start_hyprland_move() -> Option<std::sync::mpsc::Sender<Point<i32>>> {
     Some(sender)
 }
 
+/// CDXC:PlatformSupport 2026-11-14 DECISION:
+/// User: "make double clicking titlebar on omarchy full screen the app (regular full screen like pressing maximise button in the new floating titlebar in omarchy 4.5)". Omarchy's window rules give every window `suppress_event = "maximize"`, so the `_NET_WM_STATE` maximize request `zoom` sends elsewhere was dropped and a double-click on a drag strip did nothing. On Hyprland `zoom` sends what Omarchy's titlebar maximize button and its double-click send (workspace-modes.lua): `hl.dsp.window.fullscreen({ mode = "maximized", action = "toggle" })` for the window, which a second double-click undoes; an older Hyprland gets `fullscreen 1`, the same toggle for its active window. The window is Hyprland's active window, which the double-click made it, checked against this process's id.
+#[cfg(target_os = "linux")]
+fn toggle_hyprland_maximize() {
+    std::thread::Builder::new()
+        .name("hyprland-maximize".into())
+        .spawn(|| {
+            let Some(window) = hyprland_active_window() else {
+                return;
+            };
+            let address = window.address;
+            let lua = format!(
+                r#"dispatch hl.dsp.window.fullscreen({{ mode = "maximized", action = "toggle", window = "address:{address}" }})"#
+            );
+            if !hyprland_request(&lua).is_some_and(|answer| answer.trim() == "ok") {
+                hyprland_request("dispatch fullscreen 1");
+            }
+        })
+        .log_err();
+}
+
 /// Moves the window to `to` in Hyprland's logical coordinates, in its Lua dispatch (0.56 and
 /// later) while `lua` and the older one otherwise; answers whether the Lua dispatch is the one
 /// to use next time.
@@ -2371,6 +2392,11 @@ impl PlatformWindow for X11Window {
     }
 
     fn zoom(&self) {
+        #[cfg(target_os = "linux")]
+        if window_manager_ignores_moveresize() {
+            toggle_hyprland_maximize();
+            return;
+        }
         let state = self.0.state.borrow();
         self.set_wm_hints(
             || "X11 SendEvent to maximize a window failed.",
