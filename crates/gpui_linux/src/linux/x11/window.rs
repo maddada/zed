@@ -1126,31 +1126,72 @@ impl X11WindowStatePtr {
 struct ClientMove {
     pointer: Point<i32>,
     origin: Point<i32>,
-    /// Keeps Hyprland's animation off for the window until the move ends and this is dropped
-    /// (`hold_hyprland_animation_off`).
-    _animation_off: std::sync::mpsc::Sender<()>,
+    /// The pointer's travel since the press, handed to the thread that has Hyprland move the
+    /// window (`HyprlandMove`); dropping it ends the move. `None` when Hyprland could not name the
+    /// window, and the window moves itself with ConfigureWindow.
+    hyprland: Option<std::sync::mpsc::Sender<Point<i32>>>,
+}
+
+/// The window being moved as Hyprland knows it: its address, its top-left corner in Hyprland's
+/// logical coordinates and the scale of its monitor, from logical to X pixels.
+#[cfg(target_os = "linux")]
+struct HyprlandMove {
+    address: String,
+    at: Point<f64>,
+    scale: f64,
 }
 
 /// CDXC:PlatformSupport 2026-11-14 WHY:
-/// User: "moving the window around in omarchy when im in floating mode is SUPER jerky and bad". Hyprland animates every position an X11 window asks for (`CGeometricMovableAnimated::setBox` sets the animated `m_realPosition`), so each pointer step of a move restarted Omarchy's window-move animation and the window slid behind the pointer in jumps. While a move runs the window gets Hyprland's `no_anim` property, and the property is unset when it ends, so each step lands at once and the window's open and close animations stay. Hyprland's own Super+drag can't be started for the window instead: its `mouse` dispatcher (`hyprctl dispatch mouse`, `hl.dsp.window.drag()`) only starts a drag from a key binding's press. The window is found as Hyprland's active window, which the press that started the move made it, checked against this process's id.
+/// User: "moving the window around in omarchy when im in floating mode is SUPER jerky and bad", then "less jerky but flashes to black repeatedly over and over when i move it around". Hyprland animates every position an X11 window asks for, so each pointer step restarted Omarchy's window-move animation; and under a fractional scale (Omarchy's 1.6) a position the window asked for with ConfigureWindow lands at a fraction of a logical pixel, which Hyprland rounds into a size one pixel off (960x666 and 960x667 in turn on every step), so the window resized its drawing surface on every step and flashed black. On Hyprland the window is therefore moved by Hyprland itself (its window move dispatch, in whole logical pixels, which keeps the size), from a thread that always sends the latest pointer position, with Hyprland's `no_anim` property on the window until the move ends. Hyprland's own Super+drag can't be started for the window instead: its `mouse` dispatcher (`hyprctl dispatch mouse`, `hl.dsp.window.drag()`) only starts a drag from a key binding's press. The window is found as Hyprland's active window, which the press that started the move made it, checked against this process's id; when that fails the window moves itself with ConfigureWindow as before.
 #[cfg(target_os = "linux")]
-fn hold_hyprland_animation_off() -> std::sync::mpsc::Sender<()> {
-    let (sender, ended) = std::sync::mpsc::channel::<()>();
+fn start_hyprland_move() -> Option<std::sync::mpsc::Sender<Point<i32>>> {
+    let window = hyprland_active_window()?;
+    let (sender, travel) = std::sync::mpsc::channel::<Point<i32>>();
     std::thread::Builder::new()
         .name("hyprland-move".into())
         .spawn(move || {
-            let Some(address) = hyprland_active_window_address() else {
-                return;
-            };
-            if !set_hyprland_window_prop(&address, "no_anim", "1") {
-                return;
+            let animation_off = set_hyprland_window_prop(&window.address, "no_anim", "1");
+            let mut lua = true;
+            let mut placed = None;
+            // Waits for the next step, then skips to the newest one queued behind it.
+            while let Ok(mut step) = travel.recv() {
+                while let Ok(newer) = travel.try_recv() {
+                    step = newer;
+                }
+                let to = (
+                    (window.at.x + f64::from(step.x) / window.scale).round() as i64,
+                    (window.at.y + f64::from(step.y) / window.scale).round() as i64,
+                );
+                if placed == Some(to) {
+                    continue;
+                }
+                placed = Some(to);
+                lua = move_hyprland_window(&window.address, to, lua);
             }
-            // Returns once the move ends and drops its sender.
-            ended.recv().ok();
-            set_hyprland_window_prop(&address, "no_anim", "unset");
+            if animation_off {
+                set_hyprland_window_prop(&window.address, "no_anim", "unset");
+            }
         })
-        .log_err();
-    sender
+        .log_err()?;
+    Some(sender)
+}
+
+/// Moves the window to `to` in Hyprland's logical coordinates, in its Lua dispatch (0.56 and
+/// later) while `lua` and the older one otherwise; answers whether the Lua dispatch is the one
+/// to use next time.
+#[cfg(target_os = "linux")]
+fn move_hyprland_window(address: &str, to: (i64, i64), lua: bool) -> bool {
+    let (x, y) = to;
+    let lua_request = format!(
+        r#"dispatch hl.dsp.window.move({{ x = {x}, y = {y}, window = "address:{address}" }})"#
+    );
+    if lua && hyprland_request(&lua_request).is_some_and(|answer| answer.trim() == "ok") {
+        return true;
+    }
+    hyprland_request(&format!(
+        "dispatch movewindowpixel exact {x} {y},address:{address}"
+    ));
+    false
 }
 
 /// One request on Hyprland's request socket and its answer.
@@ -1166,7 +1207,7 @@ fn hyprland_request(request: &str) -> Option<String> {
             .join(".socket.sock"),
     )
     .ok()?;
-    let timeout = Some(std::time::Duration::from_secs(1));
+    let timeout = Some(std::time::Duration::from_millis(250));
     socket.set_read_timeout(timeout).ok()?;
     socket.set_write_timeout(timeout).ok()?;
     socket.write_all(request.as_bytes()).ok()?;
@@ -1175,14 +1216,32 @@ fn hyprland_request(request: &str) -> Option<String> {
     Some(answer)
 }
 
-/// Hyprland's address of its active window when this process owns it.
+/// Hyprland's active window when this process owns it, with its monitor's scale.
 #[cfg(target_os = "linux")]
-fn hyprland_active_window_address() -> Option<String> {
-    let answer: serde_json::Value =
+fn hyprland_active_window() -> Option<HyprlandMove> {
+    let window: serde_json::Value =
         serde_json::from_str(&hyprland_request("j/activewindow")?).ok()?;
-    (answer.get("pid")?.as_u64()? == u64::from(std::process::id()))
-        .then(|| answer.get("address")?.as_str().map(str::to_string))
-        .flatten()
+    if window.get("pid")?.as_u64()? != u64::from(std::process::id()) {
+        return None;
+    }
+    let at = window.get("at")?.as_array()?;
+    let monitor = window.get("monitor")?.as_i64()?;
+    let monitors: serde_json::Value =
+        serde_json::from_str(&hyprland_request("j/monitors")?).ok()?;
+    let scale = monitors
+        .as_array()?
+        .iter()
+        .find(|entry| entry.get("id").and_then(serde_json::Value::as_i64) == Some(monitor))?
+        .get("scale")?
+        .as_f64()?;
+    Some(HyprlandMove {
+        address: window.get("address")?.as_str()?.to_string(),
+        at: Point {
+            x: at.first()?.as_f64()?,
+            y: at.get(1)?.as_f64()?,
+        },
+        scale: if scale > 0.0 { scale } else { 1.0 },
+    })
 }
 
 /// Sets a window property, in the Lua dispatch of Hyprland 0.56 and later or the older one.
@@ -1220,7 +1279,11 @@ impl X11WindowStatePtr {
             self.xcb
                 .translate_coordinates(self.x_window, x_root_window, 0, 0),
         )?;
-        self.state.borrow_mut().client_move = Some(ClientMove {
+        let mut state = self.state.borrow_mut();
+        // The user placing the window ends the moments in which the window manager's changes
+        // to the app's frame are undone (`hold_app_frame`).
+        state.app_frame_held_until = None;
+        state.client_move = Some(ClientMove {
             pointer: Point {
                 x: pointer.root_x as i32,
                 y: pointer.root_y as i32,
@@ -1229,7 +1292,7 @@ impl X11WindowStatePtr {
                 x: origin.dst_x as i32,
                 y: origin.dst_y as i32,
             },
-            _animation_off: hold_hyprland_animation_off(),
+            hyprland: start_hyprland_move(),
         });
         Ok(())
     }
@@ -1237,22 +1300,33 @@ impl X11WindowStatePtr {
     /// Follows the pointer, at root position `root_x`, `root_y`, during a move the app does
     /// itself; false when there is none, so the motion is the app's.
     pub(crate) fn continue_client_move(&self, root_x: i32, root_y: i32) -> bool {
-        let Some((x, y)) = self.state.borrow().client_move.as_ref().map(|moving| {
+        let Some((x, y, hyprland)) = self.state.borrow().client_move.as_ref().map(|moving| {
             (
                 moving.origin.x + root_x - moving.pointer.x,
                 moving.origin.y + root_y - moving.pointer.y,
+                moving.hyprland.as_ref().map(|hyprland| {
+                    hyprland
+                        .send(Point {
+                            x: root_x - moving.pointer.x,
+                            y: root_y - moving.pointer.y,
+                        })
+                        .is_ok()
+                }),
             )
         }) else {
             return false;
         };
+        // A move in the moments after the window opened is the user's, not one to undo.
+        self.set_app_frame_origin(x, y);
+        if hyprland == Some(true) {
+            return true;
+        }
         // Not waited on: a round trip per pointer step held up the next step.
         self.xcb
             .configure_window(self.x_window, &xproto::ConfigureWindowAux::new().x(x).y(y))
             .map(|cookie| cookie.ignore_error())
             .log_err();
         xcb_flush(&self.xcb);
-        // A move in the moments after the window opened is the user's, not one to undo.
-        self.set_app_frame_origin(x, y);
         true
     }
 
