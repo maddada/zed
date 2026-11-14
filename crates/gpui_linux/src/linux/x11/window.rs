@@ -267,6 +267,14 @@ pub struct X11WindowState {
     #[cfg(target_os = "linux")]
     explicit_owner: Option<X11WindowStatePtr>,
     fixed_size: bool,
+    /// The device-pixel frame the app placed a window at whose geometry the app owns, and until when
+    /// a window manager's change to it is undone (`hold_app_frame`).
+    #[cfg(target_os = "linux")]
+    app_frame: Option<Bounds<i32>>,
+    #[cfg(target_os = "linux")]
+    app_frame_held_until: Option<std::time::Instant>,
+    #[cfg(target_os = "linux")]
+    app_frame_restores: u8,
     #[cfg(target_os = "linux")]
     owned_children: FxHashSet<xproto::Window>,
     children: FxHashSet<xproto::Window>,
@@ -925,10 +933,32 @@ impl X11WindowState {
 
             let display = Rc::new(X11Display::new(xcb, scale_factor, x_screen_index)?);
 
+            #[cfg(target_os = "linux")]
+            let app_frame = (params.kind == WindowKind::PopUp
+                || (fixed_size
+                    && explicit_owner.is_some()
+                    && app_frame_needs_holding_on_hyprland()))
+            .then_some(Bounds {
+                origin: Point {
+                    x: bounds.origin.x.0,
+                    y: bounds.origin.y.0,
+                },
+                size: Size {
+                    width: bounds.size.width.0,
+                    height: bounds.size.height.0,
+                },
+            });
+
             Ok(Self {
                 #[cfg(target_os = "linux")]
                 explicit_owner,
                 fixed_size,
+                #[cfg(target_os = "linux")]
+                app_frame,
+                #[cfg(target_os = "linux")]
+                app_frame_held_until: None,
+                #[cfg(target_os = "linux")]
+                app_frame_restores: 0,
                 #[cfg(target_os = "linux")]
                 owned_children: FxHashSet::default(),
                 parent,
@@ -988,6 +1018,83 @@ impl X11WindowState {
 
     fn content_size(&self) -> Size<Pixels> {
         self.bounds.size
+    }
+}
+
+/// CDXC:PlatformSupport 2026-11-14 WHY:
+/// Omarchy's floating workspaces give every window that opens on them a window rule (float, `min(1100, 64%) x min(760, 68%)`, centred with a cascade) that Hyprland also applies to override-redirect windows and to an owned window's fixed min = max size, so a 24px modal close button, a toast, a tooltip, a composer menu or an app modal opened as a 1100x760 window (an invisible one over the app for the pop-ups) away from where the app put it. A window whose frame the app owns (override-redirect, or fixed-size with an owner on Hyprland) puts the app's frame back when the window manager changes it in the moments after it maps; a later move, such as the user dragging a dialog, is left alone. Other window managers already keep these frames, so nothing changes there.
+#[cfg(target_os = "linux")]
+fn app_frame_needs_holding_on_hyprland() -> bool {
+    std::env::var_os("HYPRLAND_INSTANCE_SIGNATURE").is_some()
+}
+
+#[cfg(target_os = "linux")]
+const APP_FRAME_HOLD: std::time::Duration = std::time::Duration::from_millis(1500);
+/// A window manager that keeps forcing its frame wins after this many restores, so the app is never
+/// left believing in a frame the window doesn't have.
+#[cfg(target_os = "linux")]
+const APP_FRAME_MAX_RESTORES: u8 = 3;
+
+impl X11WindowStatePtr {
+    /// Starts the moments after a map in which a window manager's change to the app's frame is undone.
+    #[cfg(target_os = "linux")]
+    fn hold_app_frame(&self) {
+        let mut state = self.state.borrow_mut();
+        if state.app_frame.is_some() {
+            state.app_frame_held_until = Some(std::time::Instant::now() + APP_FRAME_HOLD);
+            state.app_frame_restores = 0;
+        }
+    }
+
+    /// Puts the app's frame back when a window manager moved or resized the window while it is held,
+    /// and says so, so the frame the window manager forced is never handed to the app (a pop-up that
+    /// fits itself to its content would otherwise keep the forced width).
+    #[cfg(target_os = "linux")]
+    fn restore_app_frame(&self, reported: Bounds<i32>) -> bool {
+        let frame = {
+            let mut state = self.state.borrow_mut();
+            let Some(frame) = state.app_frame else {
+                return false;
+            };
+            if frame == reported
+                || state.app_frame_restores >= APP_FRAME_MAX_RESTORES
+                || state
+                    .app_frame_held_until
+                    .is_none_or(|until| std::time::Instant::now() > until)
+            {
+                return false;
+            }
+            state.app_frame_restores += 1;
+            frame
+        };
+        check_reply(
+            || "X11 ConfigureWindow restoring the app's frame failed.",
+            self.xcb.configure_window(
+                self.x_window,
+                &xproto::ConfigureWindowAux::new()
+                    .x(frame.origin.x)
+                    .y(frame.origin.y)
+                    .width(frame.size.width as u32)
+                    .height(frame.size.height as u32),
+            ),
+        )
+        .log_err();
+        xcb_flush(&self.xcb);
+        true
+    }
+
+    #[cfg(target_os = "linux")]
+    fn set_app_frame_size(&self, width: i32, height: i32) {
+        if let Some(frame) = self.state.borrow_mut().app_frame.as_mut() {
+            frame.size = Size { width, height };
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn set_app_frame_origin(&self, x: i32, y: i32) {
+        if let Some(frame) = self.state.borrow_mut().app_frame.as_mut() {
+            frame.origin = Point { x, y };
+        }
     }
 }
 
@@ -1453,6 +1560,17 @@ impl X11WindowStatePtr {
     }
 
     pub fn set_bounds(&self, bounds: Bounds<i32>) -> anyhow::Result<()> {
+        #[cfg(target_os = "linux")]
+        if self.restore_app_frame(bounds) {
+            let mut state = self.state.borrow_mut();
+            if let Some(value) = state.last_sync_counter.take() {
+                check_reply(
+                    || "X11 sync SetCounter failed.",
+                    sync::set_counter(&self.xcb, state.counter_id, value),
+                )?;
+            }
+            return Ok(());
+        }
         let (is_resize, content_size, scale_factor) = {
             let mut state = self.state.borrow_mut();
             let bounds = bounds.map(|f| px(f as f32 / state.scale_factor));
@@ -1616,6 +1734,13 @@ impl PlatformWindow for X11Window {
     }
 
     fn resize(&mut self, size: Size<Pixels>) {
+        #[cfg(target_os = "linux")]
+        {
+            let scale_factor = self.0.state.borrow().scale_factor;
+            let device_size = size.to_device_pixels(scale_factor);
+            self.0
+                .set_app_frame_size(device_size.width.0, device_size.height.0);
+        }
         let state = self.0.state.borrow();
         let size = size.to_device_pixels(state.scale_factor);
         let width = size.width.0 as u32;
@@ -1673,6 +1798,7 @@ impl PlatformWindow for X11Window {
         self.resize(bounds.size);
         let scale = self.0.state.borrow().scale_factor;
         let origin = bounds.to_device_pixels(scale).origin;
+        self.0.set_app_frame_origin(origin.x.0, origin.y.0);
         let moved = check_reply(
             || "X11 transient window placement failed",
             self.0.xcb.configure_window(
@@ -1759,6 +1885,8 @@ impl PlatformWindow for X11Window {
         // CDXC:PlatformSupport 2026-09-11 WHY:
         // Windows created with show=false stay unmapped until activation; requesting focus alone cannot reveal them.
         // SEE-ALSO: gpui/src/window.rs (initial mapping respects show).
+        #[cfg(target_os = "linux")]
+        self.0.hold_app_frame();
         if check_reply(
             || "X11 MapWindow on activation failed.",
             self.0.xcb.map_window(self.0.x_window),
@@ -1874,6 +2002,8 @@ impl PlatformWindow for X11Window {
     }
 
     fn map_window(&mut self) -> anyhow::Result<()> {
+        #[cfg(target_os = "linux")]
+        self.0.hold_app_frame();
         check_reply(
             || "X11 MapWindow failed.",
             self.0.xcb.map_window(self.0.x_window),
