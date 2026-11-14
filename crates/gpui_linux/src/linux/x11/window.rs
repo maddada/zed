@@ -934,10 +934,14 @@ impl X11WindowState {
             let display = Rc::new(X11Display::new(xcb, scale_factor, x_screen_index)?);
 
             #[cfg(target_os = "linux")]
+            // CDXC:PlatformSupport 2026-11-14 WHY: a Floating window opened without `x11_parent`
+            // (the chat's answer and reply box, among others) was not held, so on Omarchy's floating
+            // workspaces it opened at 1100x760; every Floating or Dialog window is placed by the app,
+            // resizable or not, so on Hyprland they are all held.
             let app_frame = (params.kind == WindowKind::PopUp
-                || (fixed_size
-                    && explicit_owner.is_some()
-                    && app_frame_needs_holding_on_hyprland()))
+                || (app_frame_needs_holding_on_hyprland()
+                    && (matches!(params.kind, WindowKind::Floating | WindowKind::Dialog)
+                        || (fixed_size && explicit_owner.is_some()))))
             .then_some(Bounds {
                 origin: Point {
                     x: bounds.origin.x.0,
@@ -1022,7 +1026,7 @@ impl X11WindowState {
 }
 
 /// CDXC:PlatformSupport 2026-11-14 WHY:
-/// Omarchy's floating workspaces give every window that opens on them a window rule (float, `min(1100, 64%) x min(760, 68%)`, centred with a cascade) that Hyprland also applies to override-redirect windows and to an owned window's fixed min = max size, so a 24px modal close button, a toast, a tooltip, a composer menu or an app modal opened as a 1100x760 window (an invisible one over the app for the pop-ups) away from where the app put it. A window whose frame the app owns (override-redirect, or fixed-size with an owner on Hyprland) puts the app's frame back when the window manager changes it in the moments after it maps; a later move, such as the user dragging a dialog, is left alone. Other window managers already keep these frames, so nothing changes there.
+/// Omarchy's floating workspaces give every window that opens on them a window rule (float, `min(1100, 64%) x min(760, 68%)`, centred with a cascade) that Hyprland also applies to override-redirect windows and to an owned window's fixed min = max size, so a 24px modal close button, a toast, a tooltip, a composer menu or an app modal opened as a 1100x760 window (an invisible one over the app for the pop-ups) away from where the app put it. A window whose frame the app owns (override-redirect, and on Hyprland every Floating or Dialog window and every fixed-size window with an owner) puts the app's frame back when the window manager changes it in the moments after it maps; a later move, such as the user dragging a dialog, is left alone. Other window managers already keep these frames, so nothing changes there.
 #[cfg(target_os = "linux")]
 fn app_frame_needs_holding_on_hyprland() -> bool {
     std::env::var_os("HYPRLAND_INSTANCE_SIGNATURE").is_some()
