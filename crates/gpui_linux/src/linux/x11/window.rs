@@ -263,6 +263,9 @@ pub struct X11WindowState {
     /// `activate` asked the WM for focus while the window did not have it; the keyboard-focus child
     /// takes focus when the WM grants it.
     activation_focus_pending: bool,
+    /// An override-redirect pop-up opened with `focus` and an `x11_parent`, which takes the keyboard
+    /// itself once mapped (`focus_override_redirect_after_map`).
+    focus_on_map: bool,
     parent: Option<X11WindowStatePtr>,
     #[cfg(target_os = "linux")]
     explicit_owner: Option<X11WindowStatePtr>,
@@ -953,6 +956,14 @@ impl X11WindowState {
                 },
             });
 
+            // Only a pop-up with an owner: a work area dropdown (no owner) that took the keyboard
+            // would deactivate the main window, which closes it.
+            #[cfg(target_os = "linux")]
+            let focus_on_map =
+                params.kind == WindowKind::PopUp && params.focus && explicit_owner.is_some();
+            #[cfg(not(target_os = "linux"))]
+            let focus_on_map = false;
+
             Ok(Self {
                 #[cfg(target_os = "linux")]
                 explicit_owner,
@@ -968,6 +979,7 @@ impl X11WindowState {
                 parent,
                 keyboard_focus_window,
                 activation_focus_pending: false,
+                focus_on_map,
                 children: FxHashSet::default(),
                 client,
                 executor,
@@ -1288,6 +1300,33 @@ impl X11Window {
 }
 
 impl X11WindowStatePtr {
+    /// Gives an override-redirect pop-up opened with `focus` and an `x11_parent` the keyboard once it
+    /// is mapped.
+    ///
+    /// CDXC:PlatformSupport 2026-11-14 WHY: no window manager manages an override-redirect window,
+    /// so the focus `activate` asks it for (`_NET_ACTIVE_WINDOW`) never comes, and keys kept going to
+    /// the window under it. Ghostex's chat menus open as override-redirect pop-ups on Hyprland, so
+    /// Omarchy's open rule never places them before the app does (popup_frame.rs
+    /// `menu_window_kind`), and their search field, arrow keys and Escape need the keyboard; an X11
+    /// menu takes it itself, as here.
+    pub(crate) fn focus_override_redirect_after_map(&self) {
+        let keyboard_focus_window = {
+            let mut state = self.state.borrow_mut();
+            if !std::mem::take(&mut state.focus_on_map) {
+                return;
+            }
+            state.keyboard_focus_window
+        };
+        self.xcb
+            .set_input_focus(
+                xproto::InputFocus::POINTER_ROOT,
+                keyboard_focus_window,
+                xproto::Time::CURRENT_TIME,
+            )
+            .log_err();
+        xcb_flush(&self.xcb);
+    }
+
     /// Moves X focus from the toplevel to its keyboard-focus child when the WM grants focus that
     /// `activate` asked for. Only focus arriving from outside the window (`Ancestor`, `Nonlinear`)
     /// counts: focus coming back from an inferior is an embedded client's own handoff, and focus

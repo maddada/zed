@@ -911,11 +911,18 @@ impl X11Client {
                 handle_visibility_changed(state, event.window);
             }
             Event::MapNotify(event) => {
-                let mut state = self.0.borrow_mut();
-                if let Some(window_ref) = state.windows.get_mut(&event.window) {
-                    window_ref.is_mapped = true;
+                let mapped = {
+                    let mut state = self.0.borrow_mut();
+                    let mapped = state.windows.get_mut(&event.window).map(|window_ref| {
+                        window_ref.is_mapped = true;
+                        window_ref.window.clone()
+                    });
+                    handle_visibility_changed(state, event.window);
+                    mapped
+                };
+                if let Some(window) = mapped {
+                    window.focus_override_redirect_after_map();
                 }
-                handle_visibility_changed(state, event.window);
             }
             Event::VisibilityNotify(event) => {
                 let mut state = self.0.borrow_mut();
