@@ -1123,10 +1123,79 @@ impl X11WindowStatePtr {
 /// Where the pointer and the window's top-left corner were, in root device pixels, when a move
 /// the app does itself started.
 #[cfg(target_os = "linux")]
-#[derive(Clone, Copy)]
 struct ClientMove {
     pointer: Point<i32>,
     origin: Point<i32>,
+    /// Keeps Hyprland's animation off for the window until the move ends and this is dropped
+    /// (`hold_hyprland_animation_off`).
+    _animation_off: std::sync::mpsc::Sender<()>,
+}
+
+/// CDXC:PlatformSupport 2026-11-14 WHY:
+/// User: "moving the window around in omarchy when im in floating mode is SUPER jerky and bad". Hyprland animates every position an X11 window asks for (`CGeometricMovableAnimated::setBox` sets the animated `m_realPosition`), so each pointer step of a move restarted Omarchy's window-move animation and the window slid behind the pointer in jumps. While a move runs the window gets Hyprland's `no_anim` property, and the property is unset when it ends, so each step lands at once and the window's open and close animations stay. Hyprland's own Super+drag can't be started for the window instead: its `mouse` dispatcher (`hyprctl dispatch mouse`, `hl.dsp.window.drag()`) only starts a drag from a key binding's press. The window is found as Hyprland's active window, which the press that started the move made it, checked against this process's id.
+#[cfg(target_os = "linux")]
+fn hold_hyprland_animation_off() -> std::sync::mpsc::Sender<()> {
+    let (sender, ended) = std::sync::mpsc::channel::<()>();
+    std::thread::Builder::new()
+        .name("hyprland-move".into())
+        .spawn(move || {
+            let Some(address) = hyprland_active_window_address() else {
+                return;
+            };
+            if !set_hyprland_window_prop(&address, "no_anim", "1") {
+                return;
+            }
+            // Returns once the move ends and drops its sender.
+            ended.recv().ok();
+            set_hyprland_window_prop(&address, "no_anim", "unset");
+        })
+        .log_err();
+    sender
+}
+
+/// One request on Hyprland's request socket and its answer.
+#[cfg(target_os = "linux")]
+fn hyprland_request(request: &str) -> Option<String> {
+    use std::io::{Read as _, Write as _};
+    let signature = std::env::var_os("HYPRLAND_INSTANCE_SIGNATURE")?;
+    let runtime = std::env::var_os("XDG_RUNTIME_DIR")?;
+    let mut socket = std::os::unix::net::UnixStream::connect(
+        std::path::Path::new(&runtime)
+            .join("hypr")
+            .join(signature)
+            .join(".socket.sock"),
+    )
+    .ok()?;
+    let timeout = Some(std::time::Duration::from_secs(1));
+    socket.set_read_timeout(timeout).ok()?;
+    socket.set_write_timeout(timeout).ok()?;
+    socket.write_all(request.as_bytes()).ok()?;
+    let mut answer = String::new();
+    socket.take(1024 * 1024).read_to_string(&mut answer).ok()?;
+    Some(answer)
+}
+
+/// Hyprland's address of its active window when this process owns it.
+#[cfg(target_os = "linux")]
+fn hyprland_active_window_address() -> Option<String> {
+    let answer: serde_json::Value =
+        serde_json::from_str(&hyprland_request("j/activewindow")?).ok()?;
+    (answer.get("pid")?.as_u64()? == u64::from(std::process::id()))
+        .then(|| answer.get("address")?.as_str().map(str::to_string))
+        .flatten()
+}
+
+/// Sets a window property, in the Lua dispatch of Hyprland 0.56 and later or the older one.
+#[cfg(target_os = "linux")]
+fn set_hyprland_window_prop(address: &str, prop: &str, value: &str) -> bool {
+    [
+        format!(
+            r#"dispatch hl.dsp.window.set_prop({{ prop = "{prop}", value = "{value}", window = "address:{address}" }})"#
+        ),
+        format!("dispatch setprop address:{address} {prop} {value}"),
+    ]
+    .iter()
+    .any(|request| hyprland_request(request).is_some_and(|answer| answer.trim() == "ok"))
 }
 
 /// CDXC:PlatformSupport 2026-11-14 WHY:
@@ -1160,6 +1229,7 @@ impl X11WindowStatePtr {
                 x: origin.dst_x as i32,
                 y: origin.dst_y as i32,
             },
+            _animation_off: hold_hyprland_animation_off(),
         });
         Ok(())
     }
@@ -1167,17 +1237,19 @@ impl X11WindowStatePtr {
     /// Follows the pointer, at root position `root_x`, `root_y`, during a move the app does
     /// itself; false when there is none, so the motion is the app's.
     pub(crate) fn continue_client_move(&self, root_x: i32, root_y: i32) -> bool {
-        let Some(moving) = self.state.borrow().client_move else {
+        let Some((x, y)) = self.state.borrow().client_move.as_ref().map(|moving| {
+            (
+                moving.origin.x + root_x - moving.pointer.x,
+                moving.origin.y + root_y - moving.pointer.y,
+            )
+        }) else {
             return false;
         };
-        let x = moving.origin.x + root_x - moving.pointer.x;
-        let y = moving.origin.y + root_y - moving.pointer.y;
-        check_reply(
-            || "X11 ConfigureWindow moving the window failed.",
-            self.xcb
-                .configure_window(self.x_window, &xproto::ConfigureWindowAux::new().x(x).y(y)),
-        )
-        .log_err();
+        // Not waited on: a round trip per pointer step held up the next step.
+        self.xcb
+            .configure_window(self.x_window, &xproto::ConfigureWindowAux::new().x(x).y(y))
+            .map(|cookie| cookie.ignore_error())
+            .log_err();
         xcb_flush(&self.xcb);
         // A move in the moments after the window opened is the user's, not one to undo.
         self.set_app_frame_origin(x, y);

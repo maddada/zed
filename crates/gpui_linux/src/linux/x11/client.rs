@@ -1792,17 +1792,19 @@ impl X11Client {
         #[cfg(not(target_os = "linux"))]
         let explicit_parent: Option<AnyWindowHandle> = None;
         // CDXC:PlatformSupport 2026-09-24 WHY:
-        // Deferred dialogs and hidden pickers must retain their owner even when a CEF child or a closing menu has keyboard focus. A stale explicit owner is an error, not permission to attach to another window.
+        // Deferred dialogs and hidden pickers must retain their owner even when a CEF child or a closing menu has keyboard focus, so an explicit owner is never swapped for the focused window.
+        // CDXC:PlatformSupport 2026-11-14 WHY:
+        // An owner that closed before the window opened (a deferred open, a menu opened from a window that went away) failed the whole open, and Ghostex showed "X11 transient owner is no longer open" as a failed card in the chat. Such a window now opens with no owner, which is what the request would have got with none; it still never borrows the focused window. Supersedes the 2026-09-24 note's "a stale explicit owner is an error".
         let parent_window = if let Some(parent) = explicit_parent {
-            Some(
-                state
-                    .windows
-                    .values()
-                    .find(|window| window.handle().window_id() == parent.window_id())
-                    .context("X11 transient owner is no longer open")?
-                    .window
-                    .clone(),
-            )
+            let owner = state
+                .windows
+                .values()
+                .find(|window| window.handle().window_id() == parent.window_id())
+                .map(|window| window.window.clone());
+            if owner.is_none() {
+                log::warn!("x11: a window's owner closed before it opened; opening it without one");
+            }
+            owner
         } else {
             state
                 .keyboard_focused_window
