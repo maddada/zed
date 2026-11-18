@@ -213,8 +213,8 @@ impl WgpuResources {
 
 pub(crate) struct WgpuRendererCore {
     pub(crate) fast_dynamic_textures: crate::fast::dynamic_textures::TextureStore,
-    glass: Option<crate::glass::GlassRenderer>,
-    frame_size: [u32; 2],
+    pub(crate) glass: Option<crate::glass::GlassRenderer>,
+    pub(crate) frame_size: [u32; 2],
     pub(crate) resources: WgpuResources,
     pub(crate) atlas: Arc<WgpuAtlas>,
     pub(crate) path_globals_offset: u64,

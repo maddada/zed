@@ -251,7 +251,26 @@ pub(crate) fn record_frame(
     frame_view: &wgpu::TextureView,
     clear_color: wgpu::Color,
 ) -> Result<Option<wgpu::SubmissionIndex>> {
-    record_into(renderer, scene, frame_view, clear_color).map(Some)
+    // A window's glass (its Picture, Wallpaper, Live or video backdrop, set
+    // only on Linux) is lent to the frame, which draws it under the scene.
+    // Without one, the frame records exactly as before.
+    let Some(mut glass) = renderer.glass.take() else {
+        return record_into(renderer, scene, frame_view, clear_color).map(Some);
+    };
+    let backdrop = Backdrop {
+        glass: &mut glass,
+        size: renderer.frame_size,
+    };
+    let result = record_over(renderer, scene, frame_view, clear_color, Some(backdrop));
+    renderer.glass = Some(glass);
+    result.map(Some)
+}
+
+/// A glass backdrop the frame draws into its texture before the scene, which
+/// then draws over it instead of clearing it.
+pub(crate) struct Backdrop<'a> {
+    glass: &'a mut crate::glass::GlassRenderer,
+    size: [u32; 2],
 }
 
 /// Records `scene` into `frame_view`, cleared to `clear` first, and submits it.
@@ -261,12 +280,24 @@ pub(crate) fn record_into(
     frame_view: &wgpu::TextureView,
     clear: wgpu::Color,
 ) -> Result<wgpu::SubmissionIndex> {
+    record_over(host, scene, frame_view, clear, None)
+}
+
+/// Records `scene` into `frame_view` over `backdrop` if there is one, else
+/// cleared to `clear`, and submits it.
+fn record_over(
+    host: &mut impl FrameHost,
+    scene: &Scene,
+    frame_view: &wgpu::TextureView,
+    clear: wgpu::Color,
+    backdrop: Option<Backdrop<'_>>,
+) -> Result<wgpu::SubmissionIndex> {
     // The state is taken for the frame so that it can change while the host
     // lends out the GPU objects. The uploaded globals stay with the host,
     // which tells the frame's alpha mode by them.
     let mut state = std::mem::take(host.frame_state());
     std::mem::swap(&mut state.globals, &mut host.frame_state().globals);
-    let result = record_with(host, &mut state, scene, frame_view, clear);
+    let result = record_with(host, &mut state, scene, frame_view, clear, backdrop);
     std::mem::swap(&mut state.globals, &mut host.frame_state().globals);
     *host.frame_state() = state;
     result
@@ -278,6 +309,7 @@ fn record_with(
     scene: &Scene,
     frame_view: &wgpu::TextureView,
     clear: wgpu::Color,
+    backdrop: Option<Backdrop<'_>>,
 ) -> Result<wgpu::SubmissionIndex> {
     state.bind_groups.begin_frame();
 
@@ -327,7 +359,7 @@ fn record_with(
             let target = host.target()?;
             state.layers.prepare(&target, &scene.layers, &planned);
             Ok(record(
-                &target, state, scene, frame_view, clear, &rasters, &raster_indices, &scenes, &uploads, &paths,
+                &target, state, scene, frame_view, clear, backdrop, &rasters, &raster_indices, &scenes, &uploads, &paths,
             ))
         });
     if result.is_err() {
@@ -591,6 +623,7 @@ fn record(
     scene: &Scene,
     frame_view: &wgpu::TextureView,
     clear: wgpu::Color,
+    backdrop: Option<Backdrop<'_>>,
     rasters: &[raster::TileRaster],
     raster_indices: &[usize],
     scenes: &[PlannedScene],
@@ -618,6 +651,21 @@ fn record(
             &graph,
         );
     }
+    // The backdrop fills the frame's texture, so the scene loads it rather
+    // than clearing it.
+    let clear = match backdrop {
+        Some(backdrop) => {
+            backdrop.glass.draw(
+                target.device,
+                target.queue,
+                &mut encoder,
+                frame_view,
+                backdrop.size,
+            );
+            None
+        }
+        None => Some(clear),
+    };
     let main = scenes.len() - 1;
     draw_scene(
         target,
@@ -629,7 +677,7 @@ fn record(
             paths,
             path_batches: &scenes[main].path_batches,
             view: frame_view,
-            clear: Some(clear),
+            clear,
             label: "main_pass",
             globals: target.globals_bind_group,
             path_targets: PathTargets {
