@@ -25,6 +25,23 @@ use gpui::{
     PlatformDispatcher, Priority, PriorityQueueSender, RunnableVariant, TimerResolutionGuard,
 };
 
+thread_local! {
+    static RUNNING_FOREGROUND_TASK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether a foreground task is running further up this thread's stack.
+///
+/// CDXC:PlatformSupport 2026-11-19 WHY:
+/// A foreground task usually holds the App borrowed, and Windows can run window messages inside
+/// it (a modal loop, a COM call or a synchronous Win32 call that pumps). The queued tasks that
+/// such a nested message runs would borrow the App again and panic; before #675 that panic
+/// aborted the app as "panic in a function that cannot unwind", after `RefCell already borrowed`
+/// errors in the log. They stay queued instead: the outer `run_foreground_task` or size-move timer
+/// loop runs them once the running task returns, and a new task posts a fresh wake-up.
+pub(crate) fn is_running_foreground_task() -> bool {
+    RUNNING_FOREGROUND_TASK.get()
+}
+
 pub(crate) struct WindowsDispatcher {
     pub(crate) wake_posted: AtomicBool,
     main_sender: PriorityQueueSender<RunnableVariant>,
@@ -86,6 +103,19 @@ impl WindowsDispatcher {
                 SetThreadpoolTimer(timer, Some(&due_time), 0, None);
             }
         }
+    }
+
+    /// Runs a runnable from the main thread's queue, noting that a foreground task is running
+    /// until it returns.
+    pub(crate) fn execute_foreground_runnable(runnable: RunnableVariant) {
+        struct Running(bool);
+        impl Drop for Running {
+            fn drop(&mut self) {
+                RUNNING_FOREGROUND_TASK.set(self.0);
+            }
+        }
+        let _running = Running(RUNNING_FOREGROUND_TASK.replace(true));
+        Self::execute_runnable(runnable);
     }
 
     #[inline(always)]

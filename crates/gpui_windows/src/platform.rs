@@ -1328,10 +1328,15 @@ impl WindowsPlatformInner {
             return false;
         };
         let mut lock = all_windows.write();
-        let index = lock
+        // A window this platform never tracked, or one whose close was already handled, used to
+        // panic here inside the platform window procedure (#675).
+        let Some(index) = lock
             .iter()
             .position(|handle| handle.as_raw() == target_window)
-            .unwrap();
+        else {
+            log::error!("closing window {target_window:?}, which is not an open window");
+            return false;
+        };
         lock.remove(index);
 
         lock.is_empty()
@@ -1341,6 +1346,12 @@ impl WindowsPlatformInner {
     fn run_foreground_task(&self) -> Option<isize> {
         const MAIN_TASK_TIMEOUT: u128 = 10;
 
+        if is_running_foreground_task() {
+            // A running task pumped this message; its loop runs the queue once it returns. Let the
+            // next task posted meanwhile wake the loop again.
+            self.dispatcher.wake_posted.store(false, Ordering::Release);
+            return Some(0);
+        }
         let start = std::time::Instant::now();
         'tasks: loop {
             'timeout_loop: loop {
@@ -1385,7 +1396,7 @@ impl WindowsPlatformInner {
                 }
                 let mut main_receiver = self.main_receiver.clone();
                 match main_receiver.try_pop() {
-                    Ok(Some(runnable)) => WindowsDispatcher::execute_runnable(runnable),
+                    Ok(Some(runnable)) => WindowsDispatcher::execute_foreground_runnable(runnable),
                     _ => break 'timeout_loop,
                 }
             }
@@ -1398,7 +1409,7 @@ impl WindowsPlatformInner {
                 Ok(Some(runnable)) => {
                     self.dispatcher.wake_posted.store(true, Ordering::Release);
 
-                    WindowsDispatcher::execute_runnable(runnable);
+                    WindowsDispatcher::execute_foreground_runnable(runnable);
                 }
                 _ => break 'tasks,
             }

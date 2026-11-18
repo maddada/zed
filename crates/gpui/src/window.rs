@@ -1909,16 +1909,29 @@ impl Window {
                 // Native destruction can re-enter while the app is borrowed.
                 // Schedule both operations without borrowing the app here.
                 cx.spawn(async move |cx| {
-                    cx.update(|cx| {
-                        // App-driven closure may already have removed the window.
-                        if cx.windows.contains_key(window_id) {
-                            handle
-                                .update(cx, |_, window, _| window.remove_window())
-                                .with_context(|| format!("handling close for window {window_id:?}"))
-                                .log_err();
+                    // The task itself can run inside another update (Windows runs window
+                    // messages, and the tasks they run, inside modal loops and pumping calls),
+                    // so wait for the app to be free instead of panicking on its borrow (#675).
+                    loop {
+                        let removed = cx.try_update(|cx| {
+                            // App-driven closure may already have removed the window.
+                            if cx.windows.contains_key(window_id) {
+                                handle
+                                    .update(cx, |_, window, _| window.remove_window())
+                                    .with_context(|| {
+                                        format!("handling close for window {window_id:?}")
+                                    })
+                                    .log_err();
+                            }
+                            SystemWindowTabController::remove_tab(cx, window_id);
+                        });
+                        if removed.is_some() || cx.app.upgrade().is_none() {
+                            break;
                         }
-                        SystemWindowTabController::remove_tab(cx, window_id);
-                    });
+                        cx.background_executor()
+                            .timer(Duration::from_millis(16))
+                            .await;
+                    }
                 })
                 .detach();
             }
