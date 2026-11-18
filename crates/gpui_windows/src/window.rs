@@ -1756,7 +1756,7 @@ unsafe extern "system" fn window_procedure(
     }
     let inner = unsafe { &*ptr };
     let result = if let Some(inner) = inner.upgrade() {
-        handle_message_catching_panics(hwnd, msg, wparam, lparam, || {
+        abort_on_window_procedure_panic(|| {
             if msg == WM_NCDESTROY {
                 inner.dialog_owner.close();
             }

@@ -317,8 +317,7 @@ impl WindowsWindowInner {
         if wparam.0 == SIZE_MOVE_LOOP_TIMER_ID {
             // Inside a running task (a modal loop it entered), the task's own loop runs the queue.
             let mut runnables = self.main_receiver.clone().try_iter();
-            while !is_panic_pending()
-                && !is_running_foreground_task()
+            while !is_running_foreground_task()
                 && let Some(Ok(runnable)) = runnables.next()
             {
                 WindowsDispatcher::execute_foreground_runnable(runnable);
