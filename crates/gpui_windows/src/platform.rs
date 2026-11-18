@@ -595,6 +595,7 @@ impl Platform for WindowsPlatform {
         }
         on_finish_launching();
 
+        resume_pending_panic();
         let mut msg = MSG::default();
         unsafe {
             while GetMessageW(&mut msg, None, 0, 0).as_bool() {
@@ -602,8 +603,11 @@ impl Platform for WindowsPlatform {
                     _ = TranslateMessage(&msg);
                     DispatchMessageW(&msg);
                 }
+                resume_pending_panic();
             }
         }
+        // A window procedure's panic posts `WM_QUIT` so modal loops end; it is resumed here.
+        resume_pending_panic();
 
         self.inner.with_callback(
             |callbacks| &callbacks.quit,
@@ -1376,6 +1380,9 @@ impl WindowsPlatformInner {
                     }
                     break 'tasks;
                 }
+                if is_panic_pending() {
+                    break 'tasks;
+                }
                 let mut main_receiver = self.main_receiver.clone();
                 match main_receiver.try_pop() {
                     Ok(Some(runnable)) => WindowsDispatcher::execute_runnable(runnable),
@@ -1909,15 +1916,9 @@ unsafe extern "system" fn window_procedure(
     }
     let inner = unsafe { &*ptr };
     let result = if let Some(inner) = inner.upgrade() {
-        if cfg!(debug_assertions) {
-            let inner = std::panic::AssertUnwindSafe(inner);
-            match std::panic::catch_unwind(|| { inner }.handle_msg(hwnd, msg, wparam, lparam)) {
-                Ok(result) => result,
-                Err(_) => std::process::abort(),
-            }
-        } else {
+        handle_message_catching_panics(hwnd, msg, wparam, lparam, || {
             inner.handle_msg(hwnd, msg, wparam, lparam)
-        }
+        })
     } else {
         unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
     };

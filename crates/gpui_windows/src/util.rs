@@ -241,3 +241,55 @@ where
     }
     result
 }
+
+thread_local! {
+    static PENDING_PANIC: std::cell::RefCell<Option<Box<dyn std::any::Any + Send>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Runs a window procedure's handling of one message, catching a panic instead of letting it
+/// unwind into Windows.
+///
+/// CDXC:CrashReports 2026-11-19 WHY:
+/// A window procedure is `extern "system"`, so a panic that reaches its frame aborts with "panic in
+/// a function that cannot unwind", and the crash report showed that instead of the real panic
+/// (GitHub #675). Every foreground task, input event and frame runs inside one, so the panic is
+/// caught here, every window procedure stops running app code (the app is no longer in a state
+/// to), modal loops are ended with `WM_QUIT`, and the message loop in `WindowsPlatform::run`
+/// resumes the unwind from Rust, which reports the panic's own message and location.
+pub(crate) fn handle_message_catching_panics(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+    handle: impl FnOnce() -> LRESULT,
+) -> LRESULT {
+    if is_panic_pending() {
+        return unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) };
+    }
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(handle)) {
+        Ok(result) => result,
+        Err(payload) => {
+            PENDING_PANIC.with_borrow_mut(|pending| {
+                if pending.is_none() {
+                    *pending = Some(payload);
+                }
+            });
+            unsafe { PostQuitMessage(101) };
+            LRESULT(0)
+        }
+    }
+}
+
+/// Whether a window procedure caught a panic that the message loop has not resumed yet.
+pub(crate) fn is_panic_pending() -> bool {
+    PENDING_PANIC.with_borrow(Option::is_some)
+}
+
+/// Continues unwinding a panic a window procedure caught, now that no Windows frame is between
+/// here and `main`.
+pub(crate) fn resume_pending_panic() {
+    if let Some(payload) = PENDING_PANIC.with_borrow_mut(Option::take) {
+        std::panic::resume_unwind(payload);
+    }
+}
