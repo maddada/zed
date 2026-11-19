@@ -213,16 +213,8 @@ impl<'a, T: 'static> Context<'a, T> {
     }
 
     /// Tell GPUI that this entity has changed and observers of it should be notified.
-    #[track_caller]
     pub fn notify(&mut self) {
-        // Ghostex: the redraw census names the view and the line that asked (TEMPORARY).
-        let cause = crate::redraw_census::cause(
-            "notify",
-            Some(std::any::type_name::<T>()),
-            std::panic::Location::caller(),
-        );
-        let entity_id = self.entity_state.entity_id;
-        crate::redraw_census::with_cause(cause, || self.app.notify(entity_id));
+        self.app.notify(self.entity_state.entity_id);
     }
 
     /// Spawn the future returned by the given function.

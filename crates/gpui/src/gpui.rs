@@ -23,8 +23,6 @@ extern crate self as gpui;
 pub mod colors;
 pub mod prelude;
 pub mod profiler;
-/// Ghostex: a temporary opt-in count of what makes windows redraw.
-pub mod redraw_census;
 
 #[macro_use]
 mod action;
