@@ -1419,7 +1419,14 @@ impl App {
 
     /// Schedules all windows in the application to be redrawn. This can be called
     /// multiple times in an update cycle and still result in a single redraw.
+    #[track_caller]
     pub fn refresh_windows(&mut self) {
+        // Ghostex: the redraw census names the line that asked (TEMPORARY).
+        crate::redraw_census::note_refresh_windows(crate::redraw_census::cause(
+            "refresh_windows",
+            None,
+            std::panic::Location::caller(),
+        ));
         self.pending_effects.push_back(Effect::RefreshWindows);
     }
 
@@ -2155,7 +2162,10 @@ impl App {
                     } => self.apply_emit_effect(emitter, event_type, &*event),
 
                     Effect::RefreshWindows => {
-                        self.apply_refresh_effect();
+                        crate::redraw_census::with_cause(
+                            crate::redraw_census::take_refresh_windows_cause(),
+                            || self.apply_refresh_effect(),
+                        );
                     }
 
                     Effect::NotifyGlobalObservers { global_type } => {
@@ -3182,7 +3192,15 @@ impl App {
     }
 
     /// Tell GPUI that an entity has changed and observers of it should be notified.
+    #[track_caller]
     pub fn notify(&mut self, entity_id: EntityId) {
+        // Ghostex: the redraw census names the line that asked (TEMPORARY).
+        let cause =
+            crate::redraw_census::cause("notify(entity)", None, std::panic::Location::caller());
+        crate::redraw_census::with_cause(cause, || self.notify_entity(entity_id));
+    }
+
+    fn notify_entity(&mut self, entity_id: EntityId) {
         crate::fast::dependencies::note_notify(&mut self.entities, entity_id);
         let window_invalidators = mem::take(
             self.window_invalidators_by_entity

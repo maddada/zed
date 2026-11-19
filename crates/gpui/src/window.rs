@@ -173,6 +173,7 @@ impl WindowInvalidator {
         inner.update_count += 1;
         inner.dirty_views.insert(entity);
         if inner.draw_phase == DrawPhase::None {
+            crate::redraw_census::note_window_dirty(self.census_id());
             #[cfg(feature = "profiler")]
             let dirty_at = Self::record_frame_dirty(&mut inner);
             let became_dirty = !inner.dirty;
@@ -199,7 +200,15 @@ impl WindowInvalidator {
         self.inner.borrow().dirty
     }
 
+    /// Ghostex: this window's number in the redraw census (TEMPORARY).
+    pub(crate) fn census_id(&self) -> usize {
+        Rc::as_ptr(&self.inner) as usize
+    }
+
     pub fn set_dirty(&self, dirty: bool) {
+        if dirty {
+            crate::redraw_census::note_window_dirty(self.census_id());
+        }
         let mut inner = self.inner.borrow_mut();
         let became_dirty = dirty && !inner.dirty;
         inner.dirty = dirty;
@@ -2682,11 +2691,16 @@ impl Window {
     }
 
     /// Mark the window as dirty, scheduling it to be redrawn on the next frame.
+    #[track_caller]
     pub fn refresh(&mut self) {
-        if self.invalidator.not_drawing() {
-            self.refreshing = true;
-            self.invalidator.set_dirty(true);
-        }
+        // Ghostex: the redraw census names the line that asked (TEMPORARY).
+        let cause = crate::redraw_census::cause("refresh", None, std::panic::Location::caller());
+        crate::redraw_census::with_cause(cause, || {
+            if self.invalidator.not_drawing() {
+                self.refreshing = true;
+                self.invalidator.set_dirty(true);
+            }
+        });
     }
 
     /// Close this window.
@@ -3053,10 +3067,16 @@ impl Window {
     /// which automatically respects [`App::reduce_motion`]. When using this
     /// method directly for decorative motion, check [`App::reduce_motion`]
     /// and skip the frame request when it is set.
+    #[track_caller]
     pub fn request_animation_frame(&self) {
         let entity = self.current_view();
         crate::fast::layers::invalidate::note_animation_frame(self, entity);
-        self.on_next_frame(move |_, cx| cx.notify(entity));
+        // Ghostex: the redraw census names the line that asked (TEMPORARY).
+        let cause =
+            crate::redraw_census::cause("animation_frame", None, std::panic::Location::caller());
+        self.on_next_frame(move |_, cx| {
+            crate::redraw_census::with_cause(cause, || cx.notify(entity))
+        });
     }
 
     /// Runs all callbacks scheduled via [`Self::on_next_frame`], returning how many ran.
@@ -3979,6 +3999,7 @@ impl Window {
         cx.entities.clear_accessed();
         debug_assert!(self.rendered_entity_stack.is_empty());
         self.invalidator.set_dirty(false);
+        crate::redraw_census::note_draw(self.invalidator.census_id());
         self.requested_autoscroll = None;
 
         // Restore the previously-used input handler.
