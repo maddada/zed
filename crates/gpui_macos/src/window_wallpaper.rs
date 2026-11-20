@@ -241,7 +241,13 @@ unsafe fn desktop_picture(screen: Id, size: &str) -> Option<(Id, Placement, Stri
         }
         let options: Id = msg_send![workspace, desktopImageOptionsForScreen: screen];
         let placement = Placement::from_options(options);
-        let key = format!("{path}|{size}|{placement:?}");
+        // A wallpaper app may write a new picture under the same name, which is a new picture.
+        let modified = std::fs::metadata(&path)
+            .and_then(|metadata| metadata.modified())
+            .ok()
+            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+            .map_or(0, |since| since.as_millis());
+        let key = format!("{path}|{modified}|{size}|{placement:?}");
         Some((url, placement, key))
     }
 }
