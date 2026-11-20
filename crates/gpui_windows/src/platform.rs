@@ -479,6 +479,12 @@ impl WindowsPlatform {
                         ) {
                             continue;
                         }
+                        // A destroyed window stays listed until its WM_GPUI_CLOSE_ONE_WINDOW is
+                        // handled on the main thread; redrawing it then only fails with "Invalid
+                        // window handle".
+                        if !unsafe { IsWindow(Some(hwnd.as_raw())) }.as_bool() {
+                            continue;
+                        }
                         unsafe {
                             if let Some(signal_at) = signal_at {
                                 if IsWindowVisible(hwnd.as_raw()).as_bool()
