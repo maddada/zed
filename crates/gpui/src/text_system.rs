@@ -237,6 +237,10 @@ pub struct TextSystem {
     pub(crate) fallback_font_stack: SmallVec<[Font; 2]>,
     font_generation: Arc<AtomicUsize>,
     font_family_substitutions: RwLock<FxHashMap<SharedString, SharedString>>,
+    /// Printable ASCII characters (`0x21..=0x7E`) for which a resolved font reports a
+    /// non-positive horizontal advance (for example Euclid Circular A's U+0060 grave accent,
+    /// authored with combining-mark metrics), paired with a spacing fallback `FontId`.
+    zero_advance_ascii: RwLock<FxHashMap<FontId, ZeroAdvanceAscii>>,
     missing_glyph_reporter: Arc<MissingGlyphReporter>,
     missing_glyph_receiver: Mutex<Option<MissingGlyphReceiver>>,
 }
@@ -244,6 +248,16 @@ pub struct TextSystem {
 /// Prefixed to a family name, asks for exactly that family whatever
 /// [`TextSystem::set_font_family_substitutions`] is set to.
 pub const EXACT_FONT_FAMILY_PREFIX: char = '\u{1}';
+
+#[derive(Clone, Copy)]
+struct ZeroAdvanceAscii {
+    /// Bit `b` (for `b` in `b'!'..=b'~'`) is set when the font has a glyph for `b as char` whose
+    /// horizontal advance is `<= 0.0`.
+    mask: u128,
+    /// Fallback font matching weight/style that provides a positive advance for every bit in
+    /// `mask`, resolved directly from `PlatformTextSystem` (bypassing family substitutions).
+    fallback: Option<FontId>,
+}
 
 #[derive(Clone)]
 enum CachedFont {
@@ -278,6 +292,7 @@ impl TextSystem {
             ],
             font_generation: Arc::default(),
             font_family_substitutions: RwLock::default(),
+            zero_advance_ascii: RwLock::default(),
             missing_glyph_reporter: Arc::new(MissingGlyphReporter {
                 generation: missing_glyph_generation.clone(),
                 sender,
@@ -317,6 +332,7 @@ impl TextSystem {
         crate::fast::text::fonts_changed();
         self.platform_text_system.add_fonts(fonts)?;
         self.font_ids_by_font.write().clear();
+        self.zero_advance_ascii.write().clear();
         self.missing_glyph_reporter.reset();
         self.font_generation.fetch_add(1, Ordering::Release);
         Ok(())
@@ -337,6 +353,7 @@ impl TextSystem {
         *self.font_family_substitutions.write() = substitutions.into_iter().collect();
         crate::fast::text::fonts_changed();
         self.font_ids_by_font.write().clear();
+        self.zero_advance_ascii.write().clear();
         self.font_generation.fetch_add(1, Ordering::Release);
     }
 
@@ -354,7 +371,11 @@ impl TextSystem {
                 ..font.clone()
             });
         }
-        let family = self.font_family_substitutions.read().get(&font.family)?.clone();
+        let family = self
+            .font_family_substitutions
+            .read()
+            .get(&font.family)?
+            .clone();
         Some(Font {
             family,
             ..font.clone()
@@ -460,6 +481,7 @@ impl TextSystem {
         font_size: Pixels,
         character: char,
     ) -> Result<Bounds<Pixels>> {
+        let font_id = self.effective_font_id_for_char(font_id, character);
         let glyph_id = self
             .platform_text_system
             .glyph_for_char(font_id, character)
@@ -474,6 +496,7 @@ impl TextSystem {
 
     /// Get the advance width for the given character, in the given font and size.
     pub fn advance(&self, font_id: FontId, font_size: Pixels, ch: char) -> Result<Size<Pixels>> {
+        let font_id = self.effective_font_id_for_char(font_id, ch);
         let glyph_id = self
             .platform_text_system
             .glyph_for_char(font_id, ch)
@@ -487,6 +510,7 @@ impl TextSystem {
     // Consider removing this?
     /// Returns the shaped layout width of for the given character, in the given font and size.
     pub fn layout_width(&self, font_id: FontId, font_size: Pixels, ch: char) -> Pixels {
+        let font_id = self.effective_font_id_for_char(font_id, ch);
         let mut buffer = [0; 4];
         let buffer = ch.encode_utf8(&mut buffer);
         self.platform_text_system
@@ -693,7 +717,7 @@ impl TextSystem {
         if let Some(error) = font_error {
             log::warn!("failed to load font {font:?}: {error:#}");
         }
-        font_id.unwrap_or_else(|| {
+        let font_id = font_id.unwrap_or_else(|| {
             panic!(
                 "failed to resolve font '{}' or any of the fallbacks: {}",
                 font.family,
@@ -702,7 +726,171 @@ impl TextSystem {
                     .map(|fallback| &fallback.family)
                     .join(", ")
             );
-        })
+        });
+        self.zero_advance_ascii_for(font_id, Some(font));
+        font_id
+    }
+
+    fn zero_advance_ascii_for(
+        &self,
+        font_id: FontId,
+        requested: Option<&Font>,
+    ) -> ZeroAdvanceAscii {
+        if let Some(entry) = self.zero_advance_ascii.read().get(&font_id).copied() {
+            return entry;
+        }
+        let mut mask = 0u128;
+        for byte in b'!'..=b'~' {
+            if let Some(glyph_id) = self
+                .platform_text_system
+                .glyph_for_char(font_id, byte as char)
+                && glyph_id.0 != 0
+                && self
+                    .platform_text_system
+                    .advance(font_id, glyph_id)
+                    .is_ok_and(|advance| advance.width <= 0.0)
+            {
+                mask |= 1u128 << byte;
+            }
+        }
+        let fallback = if mask != 0 {
+            self.find_spacing_ascii_fallback(font_id, mask, requested)
+        } else {
+            None
+        };
+        let entry = ZeroAdvanceAscii { mask, fallback };
+        self.zero_advance_ascii.write().insert(font_id, entry);
+        entry
+    }
+
+    fn has_positive_ascii_advance(&self, candidate_id: FontId, mask: u128) -> bool {
+        for byte in b'!'..=b'~' {
+            if (mask & (1u128 << byte)) == 0 {
+                continue;
+            }
+            let Some(glyph_id) = self
+                .platform_text_system
+                .glyph_for_char(candidate_id, byte as char)
+                .filter(|id| id.0 != 0)
+            else {
+                return false;
+            };
+            if !self
+                .platform_text_system
+                .advance(candidate_id, glyph_id)
+                .is_ok_and(|advance| advance.width > 0.0)
+            {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn find_spacing_ascii_fallback(
+        &self,
+        broken_id: FontId,
+        mask: u128,
+        requested: Option<&Font>,
+    ) -> Option<FontId> {
+        let try_candidate = |candidate: &Font| -> Option<FontId> {
+            let candidate_id = self.platform_text_system.font_id(candidate).ok()?;
+            if candidate_id == broken_id {
+                return None;
+            }
+            self.has_positive_ascii_advance(candidate_id, mask)
+                .then_some(candidate_id)
+        };
+
+        let resolved_font = requested
+            .cloned()
+            .or_else(|| self.get_font_for_id(broken_id));
+
+        // When the broken font came from a family substitution (e.g. an app-wide font choice
+        // mapping "DM Sans" or "Inter" -> "Euclid Circular A"), try the originally requested
+        // family first so the fallback matches the app's default sans metrics.
+        if let Some(font) = resolved_font
+            .as_ref()
+            .filter(|font| !font.family.starts_with(EXACT_FONT_FAMILY_PREFIX))
+            && let Some(candidate_id) = try_candidate(font)
+        {
+            return Some(candidate_id);
+        }
+
+        if let Some(font) = resolved_font.as_ref() {
+            crate::fast::text::find_fallback(font, &self.fallback_font_stack, try_candidate)
+        } else {
+            self.fallback_font_stack.iter().find_map(try_candidate)
+        }
+    }
+
+    fn effective_font_id_for_char(&self, font_id: FontId, ch: char) -> FontId {
+        if !ch.is_ascii() || !(b'!'..=b'~').contains(&(ch as u8)) {
+            return font_id;
+        }
+        let entry = self.zero_advance_ascii_for(font_id, None);
+        if (entry.mask & (1u128 << (ch as u8))) != 0
+            && let Some(fallback) = entry.fallback
+        {
+            return fallback;
+        }
+        font_id
+    }
+
+    fn push_font_run(
+        &self,
+        text: &str,
+        offset: usize,
+        len: usize,
+        font: &Font,
+        font_id: FontId,
+        decoration_changed: bool,
+        font_runs: &mut Vec<FontRun>,
+    ) {
+        if len == 0 {
+            return;
+        }
+        let push_piece =
+            |font_runs: &mut Vec<FontRun>, piece_len: usize, piece_font_id: FontId, split: bool| {
+                if let Some(last) = font_runs.last_mut()
+                    && last.font_id == piece_font_id
+                    && !split
+                {
+                    last.len += piece_len;
+                } else {
+                    font_runs.push(FontRun {
+                        len: piece_len,
+                        font_id: piece_font_id,
+                    });
+                }
+            };
+        let entry = self.zero_advance_ascii_for(font_id, Some(font));
+        let Some(fallback_id) = (entry.mask != 0).then_some(entry.fallback).flatten() else {
+            push_piece(font_runs, len, font_id, decoration_changed);
+            return;
+        };
+        let Some(bytes) = text.as_bytes().get(offset..offset + len) else {
+            push_piece(font_runs, len, font_id, decoration_changed);
+            return;
+        };
+        let is_zero = |byte: u8| byte < 128 && (entry.mask & (1u128 << byte)) != 0;
+        if !bytes.iter().any(|&byte| is_zero(byte)) {
+            push_piece(font_runs, len, font_id, decoration_changed);
+            return;
+        }
+        let mut cursor = 0;
+        let mut first = true;
+        while cursor < bytes.len() {
+            let use_fallback = is_zero(bytes[cursor]);
+            let start = cursor;
+            cursor += 1;
+            while cursor < bytes.len() && is_zero(bytes[cursor]) == use_fallback {
+                cursor += 1;
+            }
+            let piece_font_id = if use_fallback { fallback_id } else { font_id };
+            let split = if first { decoration_changed } else { true };
+            first = false;
+            push_piece(font_runs, cursor - start, piece_font_id, split);
+        }
     }
 }
 
@@ -838,17 +1026,15 @@ impl WindowTextSystem {
                 };
 
                 let font_id = self.resolve_font(&run.font);
-                if let Some(font_run) = font_runs.last_mut()
-                    && font_id == font_run.font_id
-                    && !decoration_changed
-                {
-                    font_run.len += run_len_within_line;
-                } else {
-                    font_runs.push(FontRun {
-                        len: run_len_within_line,
-                        font_id,
-                    });
-                }
+                self.push_font_run(
+                    &line_text,
+                    run_start - line_start,
+                    run_len_within_line,
+                    &run.font,
+                    font_id,
+                    decoration_changed,
+                    &mut font_runs,
+                );
 
                 // Preserve the remainder of the run for the next line
                 run.len -= run_len_within_line;
@@ -937,6 +1123,7 @@ impl WindowTextSystem {
         let mut font_runs = self.font_runs_buffer.take();
         font_runs.clear();
 
+        let mut offset = 0;
         for run in runs.iter() {
             let decoration_changed = if let Some(last_run) = last_run
                 && last_run.color == run.color
@@ -952,17 +1139,16 @@ impl WindowTextSystem {
             };
 
             let font_id = self.resolve_font(&run.font);
-            if let Some(font_run) = font_runs.last_mut()
-                && font_id == font_run.font_id
-                && !decoration_changed
-            {
-                font_run.len += run.len;
-            } else {
-                font_runs.push(FontRun {
-                    len: run.len,
-                    font_id,
-                });
-            }
+            self.push_font_run(
+                text,
+                offset,
+                run.len,
+                &run.font,
+                font_id,
+                decoration_changed,
+                &mut font_runs,
+            );
+            offset += run.len;
         }
 
         let layout = self.line_layout_cache.layout_line(
@@ -979,6 +1165,7 @@ impl WindowTextSystem {
 
     /// Returns the shaped layout width of for the given character, in the given font and size.
     pub fn layout_width(&self, font_id: FontId, font_size: Pixels, ch: char) -> Pixels {
+        let font_id = self.effective_font_id_for_char(font_id, ch);
         let mut buffer = [0; 4];
         let buffer: &_ = ch.encode_utf8(&mut buffer);
         self.line_layout_cache
@@ -1422,7 +1609,12 @@ mod font_resolution_tests {
 
     #[test]
     fn each_family_follows_its_own_substitution() {
-        let installed = [("Inter", 1), ("JetBrains Mono", 2), ("Georgia", 3), ("Menlo", 4)];
+        let installed = [
+            ("Inter", 1),
+            ("JetBrains Mono", 2),
+            ("Georgia", 3),
+            ("Menlo", 4),
+        ];
         let text_system = with_fonts();
         text_system.set_font_family_substitutions([
             ("Inter".into(), "Georgia".into()),
