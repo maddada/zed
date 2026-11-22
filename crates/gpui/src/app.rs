@@ -366,15 +366,19 @@ impl Application {
 
     /// Invokes a handler when an already-running application is launched.
     /// On macOS, this can occur when the application icon is double-clicked or the app is launched via the dock.
-    pub fn on_reopen<F>(&self, mut callback: F) -> &Self
+    pub fn on_reopen<F>(&self, callback: F) -> &Self
     where
         F: 'static + FnMut(&mut App),
     {
-        let this = Rc::downgrade(&self.0);
+        let cx = self.0.borrow().to_async();
+        let callback = Rc::new(RefCell::new(callback));
         self.0.borrow_mut().platform.on_reopen(Box::new(move || {
-            if let Some(app) = this.upgrade() {
-                callback(&mut app.borrow_mut());
-            }
+            let callback = callback.clone();
+            cx.update_or_defer(move |cx| {
+                if let Ok(mut callback) = callback.try_borrow_mut() {
+                    callback(cx);
+                }
+            });
         }));
         self
     }
@@ -1108,98 +1112,95 @@ impl App {
         #[cfg(feature = "profiler")]
         crate::profiler::journal::observe_power(&app.borrow());
 
+        // Platform callbacks (such as Windows `WM_POWERBROADCAST` delivered synchronously inside
+        // `DestroyWindow` or another Win32 call that pumps sent messages) can fire while `App` is
+        // already borrowed. Run them immediately when `App` is free, and otherwise defer onto the
+        // foreground executor instead of panicking with `RefCell already borrowed` (Ghostex #712).
+        let async_app = app.borrow().to_async();
+
         platform.on_keyboard_layout_change(Box::new({
-            let app = Rc::downgrade(&app);
+            let cx = async_app.clone();
             move || {
-                if let Some(app) = app.upgrade() {
-                    let cx = &mut app.borrow_mut();
+                cx.update_or_defer(|cx| {
                     cx.keyboard_layout = cx.platform.keyboard_layout();
                     cx.keyboard_mapper = cx.platform.keyboard_mapper();
                     cx.keyboard_layout_observers
                         .clone()
                         .retain(move |callback| (callback)(cx));
-                }
+                });
             }
         }));
 
         platform.on_thermal_state_change(Box::new({
-            let app = Rc::downgrade(&app);
+            let cx = async_app.clone();
             move || {
-                if let Some(app) = app.upgrade() {
-                    let cx = &mut app.borrow_mut();
+                cx.update_or_defer(|cx| {
                     cx.thermal_state_observers
                         .clone()
                         .retain(move |callback| (callback)(cx));
-                }
+                });
             }
         }));
 
         platform.on_displays_changed(Box::new({
-            let app = Rc::downgrade(&app);
+            let cx = async_app.clone();
             move || {
-                if let Some(app) = app.upgrade() {
-                    app.borrow_mut().displays_changed();
-                }
+                cx.update_or_defer(|cx| {
+                    cx.displays_changed();
+                });
             }
         }));
 
         platform.on_system_sleep(Box::new({
-            let app = Rc::downgrade(&app);
+            let cx = async_app.clone();
             move || {
-                if let Some(app) = app.upgrade() {
-                    let cx = &mut app.borrow_mut();
+                cx.update_or_defer(|cx| {
                     cx.system_sleep_observers
                         .clone()
                         .retain(move |callback| (callback)(cx));
-                }
+                });
             }
         }));
 
         platform.on_system_wake(Box::new({
-            let app = Rc::downgrade(&app);
+            let cx = async_app.clone();
             move || {
-                if let Some(app) = app.upgrade() {
-                    let cx = &mut app.borrow_mut();
+                cx.update_or_defer(|cx| {
                     cx.system_wake_observers
                         .clone()
                         .retain(move |callback| (callback)(cx));
-                }
+                });
             }
         }));
 
         platform.on_app_lifecycle(Box::new({
-            let app = Rc::downgrade(&app);
+            let cx = async_app.clone();
             move |phase| {
-                if let Some(app) = app.upgrade() {
-                    app.borrow_mut().update(|cx| {
-                        cx.app_lifecycle_observers
-                            .clone()
-                            .retain(|callback| callback(phase, cx));
-                    });
-                }
+                cx.update_or_defer(move |cx| {
+                    cx.app_lifecycle_observers
+                        .clone()
+                        .retain(|callback| callback(phase, cx));
+                });
             }
         }));
 
         platform.on_memory_warning(Box::new({
-            let app = Rc::downgrade(&app);
+            let cx = async_app.clone();
             move || {
-                if let Some(app) = app.upgrade() {
-                    app.borrow_mut().update(|cx| {
-                        cx.memory_warning_observers
-                            .clone()
-                            .retain(|callback| callback(cx));
-                    });
-                }
+                cx.update_or_defer(|cx| {
+                    cx.memory_warning_observers
+                        .clone()
+                        .retain(|callback| callback(cx));
+                });
             }
         }));
 
         platform.on_power_mode_change(Box::new({
-            let app = Rc::downgrade(&app);
+            let cx = async_app.clone();
             move || {
-                if let Some(app) = app.upgrade() {
-                    let power_mode = app.borrow().platform.power_mode();
-                    app.borrow_mut().power_mode = power_mode;
-                }
+                cx.update_or_defer(|cx| {
+                    cx.power_mode = cx.platform.power_mode();
+                });
             }
         }));
 
@@ -1989,16 +1990,20 @@ impl App {
     /// Registers the handler invoked when the user activates a system
     /// notification, either by clicking its body or one of its action
     /// buttons. Subsequent registrations replace the handler.
-    pub fn on_system_notification_response<F>(&self, mut callback: F)
+    pub fn on_system_notification_response<F>(&self, callback: F)
     where
         F: 'static + FnMut(SystemNotificationResponse, &mut App),
     {
-        let this = self.this.clone();
+        let cx = self.to_async();
+        let callback = Rc::new(RefCell::new(callback));
         self.platform
             .on_system_notification_response(Box::new(move |response| {
-                if let Some(app) = this.upgrade() {
-                    callback(response, &mut app.borrow_mut());
-                }
+                let callback = callback.clone();
+                cx.update_or_defer(move |cx| {
+                    if let Ok(mut callback) = callback.try_borrow_mut() {
+                        callback(response, cx);
+                    }
+                });
             }));
     }
 

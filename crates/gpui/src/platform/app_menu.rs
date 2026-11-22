@@ -332,18 +332,14 @@ pub(crate) fn init_app_menus(platform: &dyn Platform, cx: &App) {
     platform.on_will_open_app_menu(Box::new({
         let cx = cx.to_async();
         move || {
-            if let Some(app) = cx.app.upgrade() {
-                app.borrow_mut().update(|cx| cx.clear_pending_keystrokes());
-            }
+            cx.update_or_defer(|cx| cx.clear_pending_keystrokes());
         }
     }));
 
     platform.on_validate_app_menu_command(Box::new({
         let cx = cx.to_async();
         move |action| {
-            cx.app
-                .upgrade()
-                .map(|app| app.borrow_mut().update(|cx| cx.is_action_available(action)))
+            cx.try_update(|cx| cx.is_action_available(action))
                 .unwrap_or(false)
         }
     }));
@@ -351,9 +347,11 @@ pub(crate) fn init_app_menus(platform: &dyn Platform, cx: &App) {
     platform.on_app_menu_action(Box::new({
         let cx = cx.to_async();
         move |action| {
-            if let Some(app) = cx.app.upgrade() {
-                app.borrow_mut().update(|cx| cx.dispatch_action(action));
+            if cx.try_update(|cx| cx.dispatch_action(action)).is_some() {
+                return;
             }
+            let action = action.boxed_clone();
+            cx.update_or_defer(move |cx| cx.dispatch_action(action.as_ref()));
         }
     }));
 }

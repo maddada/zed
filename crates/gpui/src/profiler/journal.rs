@@ -844,7 +844,7 @@ pub(crate) fn observe_power(cx: &App) {
     cx.on_system_wake(|cx| {
         record_power_transition(PowerState::Awake);
         cx.spawn(async |cx| {
-            cx.update(|cx| {
+            cx.update_or_defer(|cx| {
                 for handle in cx.windows() {
                     handle
                         .update(cx, |_, window, cx| window.refresh_visibility(cx))

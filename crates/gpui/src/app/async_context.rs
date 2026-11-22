@@ -8,7 +8,7 @@ use anyhow::{Context as _, bail};
 use derive_more::{Deref, DerefMut};
 use futures::channel::oneshot;
 use futures::future::FutureExt;
-use std::{future::Future, rc::Weak};
+use std::{future::Future, rc::Weak, time::Duration};
 
 use super::{Context, WeakEntity};
 
@@ -186,6 +186,44 @@ impl AsyncApp {
         let app = self.app.upgrade()?;
         let mut lock = app.try_borrow_mut().ok()?;
         Some(lock.update(f))
+    }
+
+    /// Runs `f` inside an app update immediately when the app is free; when the app is already
+    /// borrowed (for example when Windows delivers `WM_POWERBROADCAST` or another sent message
+    /// synchronously inside `DestroyWindow`), defers `f` onto the foreground executor instead of
+    /// panicking with `RefCell already borrowed`. Does nothing if the app has been dropped.
+    pub(crate) fn update_or_defer(&self, f: impl FnOnce(&mut App) + 'static) {
+        let Some(app) = self.app.upgrade() else {
+            return;
+        };
+        if let Ok(mut lock) = app.try_borrow_mut() {
+            lock.update(f);
+            return;
+        }
+        drop(app);
+        let cx = self.clone();
+        self.foreground_executor
+            .spawn(async move {
+                // Retry if the task is polled while another App borrow is still active
+                // (e.g. a modal loop or Win32 pumping call outside a foreground task).
+                let mut f = Some(f);
+                loop {
+                    let Some(app) = cx.app.upgrade() else {
+                        return;
+                    };
+                    if let Ok(mut lock) = app.try_borrow_mut() {
+                        if let Some(f) = f.take() {
+                            lock.update(f);
+                        }
+                        return;
+                    }
+                    drop(app);
+                    cx.background_executor
+                        .timer(Duration::from_millis(16))
+                        .await;
+                }
+            })
+            .detach();
     }
 
     /// Arrange for the given callback to be invoked whenever the given entity emits an event of a given type.
