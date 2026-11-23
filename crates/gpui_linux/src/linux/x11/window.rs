@@ -1152,10 +1152,71 @@ impl X11WindowStatePtr {
 struct ClientMove {
     pointer: Point<i32>,
     origin: Point<i32>,
-    /// The pointer's travel since the press, handed to the thread that has Hyprland move the
-    /// window (`HyprlandMove`); dropping it ends the move. `None` when Hyprland could not name the
-    /// window, and the window moves itself with ConfigureWindow.
-    hyprland: Option<std::sync::mpsc::Sender<Point<i32>>>,
+    /// Wakes the thread that has Hyprland move the window (`HyprlandMove`) on each pointer step;
+    /// dropping it ends the move. `None` when Hyprland could not name the window, and the window
+    /// moves itself with ConfigureWindow.
+    hyprland: Option<std::sync::mpsc::Sender<()>>,
+    /// Hyprland's cursor at the press, which the ConfigureWindow move follows instead of the
+    /// motion's root position (`start_hyprland_move`); `None` when Hyprland doesn't answer.
+    cursor: Option<HyprlandCursor>,
+}
+
+/// Hyprland's cursor position at the press, in its logical coordinates, and the X pixels in one
+/// logical pixel.
+#[cfg(target_os = "linux")]
+struct HyprlandCursor {
+    start: Point<f64>,
+    x_pixels_per_logical: f64,
+}
+
+#[cfg(target_os = "linux")]
+impl HyprlandCursor {
+    fn at_press() -> Option<Self> {
+        let start = hyprland_cursor_position()?;
+        let options: serde_json::Value = serde_json::from_str(&hyprland_request(
+            "j/getoption xwayland:force_zero_scaling",
+        )?)
+        .ok()?;
+        let zero_scaling = options
+            .get("bool")
+            .and_then(serde_json::Value::as_bool)
+            .or_else(|| {
+                options
+                    .get("int")
+                    .and_then(serde_json::Value::as_i64)
+                    .map(|value| value != 0)
+            })?;
+        // Only XWayland's zero scaling gives X pixels other than Hyprland's logical ones; then
+        // they are the device pixels of the monitor under the cursor.
+        let x_pixels_per_logical = if zero_scaling {
+            let monitors: serde_json::Value =
+                serde_json::from_str(&hyprland_request("j/monitors")?).ok()?;
+            monitors.as_array()?.iter().find_map(|monitor| {
+                let number = |key: &str| monitor.get(key).and_then(serde_json::Value::as_f64);
+                let scale = number("scale").filter(|scale| *scale > 0.0)?;
+                let (x, y) = (number("x")?, number("y")?);
+                let width = number("width")? / scale;
+                let height = number("height")? / scale;
+                (start.x >= x && start.x < x + width && start.y >= y && start.y < y + height)
+                    .then_some(scale)
+            })?
+        } else {
+            1.0
+        };
+        Some(Self {
+            start,
+            x_pixels_per_logical,
+        })
+    }
+
+    /// The cursor's travel since the press in X pixels.
+    fn travel(&self) -> Option<Point<i32>> {
+        let now = hyprland_cursor_position()?;
+        Some(Point {
+            x: ((now.x - self.start.x) * self.x_pixels_per_logical).round() as i32,
+            y: ((now.y - self.start.y) * self.x_pixels_per_logical).round() as i32,
+        })
+    }
 }
 
 /// What Hyprland says about a window that its X11 properties don't carry, read on demand. The
@@ -1170,35 +1231,36 @@ struct HyprlandWindowState {
     maximized: std::cell::Cell<Option<bool>>,
 }
 
-/// The window being moved as Hyprland knows it: its address, its top-left corner in Hyprland's
-/// logical coordinates and the scale of its monitor, from logical to X pixels.
+/// The window being moved as Hyprland knows it: its address and its top-left corner in
+/// Hyprland's logical coordinates.
 #[cfg(target_os = "linux")]
 struct HyprlandMove {
     address: String,
     at: Point<f64>,
-    scale: f64,
 }
 
-/// CDXC:PlatformSupport 2026-11-14 WHY:
-/// User: "moving the window around in omarchy when im in floating mode is SUPER jerky and bad", then "less jerky but flashes to black repeatedly over and over when i move it around". Hyprland animates every position an X11 window asks for, so each pointer step restarted Omarchy's window-move animation; and under a fractional scale (Omarchy's 1.6) a position the window asked for with ConfigureWindow lands at a fraction of a logical pixel, which Hyprland rounds into a size one pixel off (960x666 and 960x667 in turn on every step), so the window resized its drawing surface on every step and flashed black. On Hyprland the window is therefore moved by Hyprland itself (its window move dispatch, in whole logical pixels, which keeps the size), from a thread that always sends the latest pointer position, with Hyprland's `no_anim` property on the window until the move ends. Hyprland's own Super+drag can't be started for the window instead: its `mouse` dispatcher (`hyprctl dispatch mouse`, `hl.dsp.window.drag()`) only starts a drag from a key binding's press. The window is found as Hyprland's active window, which the press that started the move made it, checked against this process's id; when that fails the window moves itself with ConfigureWindow as before.
+/// CDXC:PlatformSupport 2026-11-24 WHY:
+/// User: "moving the app around is really broken now.. jitters a ton", after the 2026-11-14 fixes for a jerky move and black flashes. A window moving itself under Hyprland's XWayland can't follow the pointer position X11 reports: XWayland makes a motion's root position from the window's X position plus the pointer's place on its Wayland surface, and while the window moves those two update at different moments, so the root position runs ahead by the last step. Following it moved the window further, which moved the root position further: the window overshot by up to 138 logical pixels and swung back about 40 times in one drag, with ConfigureWindow and with Hyprland's move dispatch alike (measured in a nested Hyprland 0.56.2 at scale 2, docs/2026-11-23/window-move-jitter/). Both moves therefore follow Hyprland's own cursor position (`j/cursorpos`), which doesn't depend on the window and kept it within 7 pixels of the pointer with no swing; a motion only says when to look. The 2026-11-14 reasons stay: Hyprland animates every position an X11 window asks for, so `no_anim` is on during the move; under a fractional scale (Omarchy's 1.6) a ConfigureWindow position lands at a fraction of a logical pixel and Hyprland rounds it into a size one pixel off, so the window resized and flashed black on every step, hence Hyprland's move dispatch in whole logical pixels, from a thread that sends only the newest position. Hyprland's own Super+drag can't be started for the window instead: its `mouse` dispatcher (`hyprctl dispatch mouse`, `hl.dsp.window.drag()`) only starts a drag from a key binding's press. The window is found as Hyprland's active window, which the press that started the move made it, checked against this process's id; when that fails the window moves itself with ConfigureWindow, steered by Hyprland's cursor too (`HyprlandCursor`), and by the root position only when Hyprland doesn't answer.
 #[cfg(target_os = "linux")]
-fn start_hyprland_move() -> Option<std::sync::mpsc::Sender<Point<i32>>> {
+fn start_hyprland_move() -> Option<std::sync::mpsc::Sender<()>> {
     let window = hyprland_active_window()?;
-    let (sender, travel) = std::sync::mpsc::channel::<Point<i32>>();
+    let start = hyprland_cursor_position()?;
+    let (sender, steps) = std::sync::mpsc::channel::<()>();
     std::thread::Builder::new()
         .name("hyprland-move".into())
         .spawn(move || {
             let animation_off = set_hyprland_window_prop(&window.address, "no_anim", "1");
             let mut lua = true;
             let mut placed = None;
-            // Waits for the next step, then skips to the newest one queued behind it.
-            while let Ok(mut step) = travel.recv() {
-                while let Ok(newer) = travel.try_recv() {
-                    step = newer;
-                }
+            // Waits for the next step, then skips the ones queued behind it.
+            while steps.recv().is_ok() {
+                while steps.try_recv().is_ok() {}
+                let Some(cursor) = hyprland_cursor_position() else {
+                    continue;
+                };
                 let to = (
-                    (window.at.x + f64::from(step.x) / window.scale).round() as i64,
-                    (window.at.y + f64::from(step.y) / window.scale).round() as i64,
+                    (window.at.x + cursor.x - start.x).round() as i64,
+                    (window.at.y + cursor.y - start.y).round() as i64,
                 );
                 if placed == Some(to) {
                     continue;
@@ -1337,7 +1399,7 @@ fn hyprland_request(request: &str) -> Option<String> {
     Some(answer)
 }
 
-/// Hyprland's active window when this process owns it, with its monitor's scale.
+/// Hyprland's active window when this process owns it.
 #[cfg(target_os = "linux")]
 fn hyprland_active_window() -> Option<HyprlandMove> {
     let window: serde_json::Value =
@@ -1346,22 +1408,22 @@ fn hyprland_active_window() -> Option<HyprlandMove> {
         return None;
     }
     let at = window.get("at")?.as_array()?;
-    let monitor = window.get("monitor")?.as_i64()?;
-    let monitors: serde_json::Value =
-        serde_json::from_str(&hyprland_request("j/monitors")?).ok()?;
-    let scale = monitors
-        .as_array()?
-        .iter()
-        .find(|entry| entry.get("id").and_then(serde_json::Value::as_i64) == Some(monitor))?
-        .get("scale")?
-        .as_f64()?;
     Some(HyprlandMove {
         address: window.get("address")?.as_str()?.to_string(),
         at: Point {
             x: at.first()?.as_f64()?,
             y: at.get(1)?.as_f64()?,
         },
-        scale: if scale > 0.0 { scale } else { 1.0 },
+    })
+}
+
+/// Where Hyprland has the cursor, in its logical coordinates.
+#[cfg(target_os = "linux")]
+fn hyprland_cursor_position() -> Option<Point<f64>> {
+    let cursor: serde_json::Value = serde_json::from_str(&hyprland_request("j/cursorpos")?).ok()?;
+    Some(Point {
+        x: cursor.get("x")?.as_f64()?,
+        y: cursor.get("y")?.as_f64()?,
     })
 }
 
@@ -1379,7 +1441,7 @@ fn set_hyprland_window_prop(address: &str, prop: &str, value: &str) -> bool {
 }
 
 /// CDXC:PlatformSupport 2026-11-14 WHY:
-/// On Omarchy a Ghostex window without a title bar (the page window a `ghostex show` card opens, the app modals) could not be dragged by its top band: Hyprland's XWayland window manager lists `_NET_WM_MOVERESIZE` as supported but drops the message (0.56 `CXWM::handleClientMessage` handles only `_NET_WM_STATE`, `WM_CHANGE_STATE`, `_NET_ACTIVE_WINDOW` and the Wayland and drag-and-drop messages), so `start_window_move` asked for a move nobody made. On Hyprland the window moves itself instead: it keeps the press's pointer grab, follows the pointer with ConfigureWindow, which Hyprland applies to a floating window, and stops at the release. Other window managers still get `_NET_WM_MOVERESIZE`.
+/// On Omarchy a Ghostex window without a title bar (the page window a `ghostex show` card opens, the app modals) could not be dragged by its top band: Hyprland's XWayland window manager lists `_NET_WM_MOVERESIZE` as supported but drops the message (0.56 `CXWM::handleClientMessage` handles only `_NET_WM_STATE`, `WM_CHANGE_STATE`, `_NET_ACTIVE_WINDOW` and the Wayland and drag-and-drop messages), so `start_window_move` asked for a move nobody made. On Hyprland the window moves itself instead: it keeps the press's pointer grab, follows the pointer (`start_hyprland_move`) and stops at the release. Other window managers still get `_NET_WM_MOVERESIZE`.
 #[cfg(target_os = "linux")]
 fn window_manager_ignores_moveresize() -> bool {
     app_frame_needs_holding_on_hyprland()
@@ -1400,6 +1462,12 @@ impl X11WindowStatePtr {
             self.xcb
                 .translate_coordinates(self.x_window, x_root_window, 0, 0),
         )?;
+        let hyprland = start_hyprland_move();
+        let cursor = if hyprland.is_none() {
+            HyprlandCursor::at_press()
+        } else {
+            None
+        };
         let mut state = self.state.borrow_mut();
         // The user placing the window ends the moments in which the window manager's changes
         // to the app's frame are undone (`hold_app_frame`).
@@ -1413,26 +1481,32 @@ impl X11WindowStatePtr {
                 x: origin.dst_x as i32,
                 y: origin.dst_y as i32,
             },
-            hyprland: start_hyprland_move(),
+            hyprland,
+            cursor,
         });
         Ok(())
     }
 
-    /// Follows the pointer, at root position `root_x`, `root_y`, during a move the app does
-    /// itself; false when there is none, so the motion is the app's.
+    /// Follows the pointer during a move the app does itself, on a motion at root position
+    /// `root_x`, `root_y` (which steers it only when Hyprland's cursor can't,
+    /// `start_hyprland_move`); false when there is none, so the motion is the app's.
     pub(crate) fn continue_client_move(&self, root_x: i32, root_y: i32) -> bool {
         let Some((x, y, hyprland)) = self.state.borrow().client_move.as_ref().map(|moving| {
+            let travel = moving
+                .cursor
+                .as_ref()
+                .and_then(HyprlandCursor::travel)
+                .unwrap_or(Point {
+                    x: root_x - moving.pointer.x,
+                    y: root_y - moving.pointer.y,
+                });
             (
-                moving.origin.x + root_x - moving.pointer.x,
-                moving.origin.y + root_y - moving.pointer.y,
-                moving.hyprland.as_ref().map(|hyprland| {
-                    hyprland
-                        .send(Point {
-                            x: root_x - moving.pointer.x,
-                            y: root_y - moving.pointer.y,
-                        })
-                        .is_ok()
-                }),
+                moving.origin.x + travel.x,
+                moving.origin.y + travel.y,
+                moving
+                    .hyprland
+                    .as_ref()
+                    .map(|hyprland| hyprland.send(()).is_ok()),
             )
         }) else {
             return false;
