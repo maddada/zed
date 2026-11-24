@@ -267,6 +267,8 @@ pub struct WgpuRenderer {
     observed_error_generation: u64,
     last_surface_error: Option<String>,
     needs_redraw: bool,
+    /// See [`Self::set_presents_through_xwayland`].
+    presents_through_xwayland: bool,
 }
 
 impl WgpuRenderer {
@@ -529,6 +531,7 @@ impl WgpuRenderer {
             observed_error_generation: 0,
             last_surface_error: None,
             needs_redraw: false,
+            presents_through_xwayland: false,
         })
     }
 }
@@ -1162,6 +1165,13 @@ impl WgpuRenderer {
         self.max_texture_size
     }
 
+    /// Tells the renderer its window is an X11 window shown by XWayland.
+    ///
+    /// CDXC:PlatformSupport 2026-11-24 WHY: On NVIDIA's driver under XWayland (Omarchy's Hyprland) a frame reached the screen before the GPU finished drawing it, so whatever the frame drew last (the chat pane, its pills, the user's message text, the Inbox rows) flickered out while the window moved and the compositor redrew it on every step. Every frame read back from the GPU was complete, and waiting for the frame before presenting it stopped the flicker (8 of 8 drags flickered before, 0 of 8 after), so on NVIDIA under XWayland each frame is presented only once the GPU has drawn it. Mesa drivers keep their implicit sync and the usual pipelining.
+    pub fn set_presents_through_xwayland(&mut self, presents_through_xwayland: bool) {
+        self.presents_through_xwayland = presents_through_xwayland;
+    }
+
     pub fn set_glass_frame(&mut self, frame: Option<crate::GlassFrame>) {
         let Some(core) = self.core_mut() else {
             return;
@@ -1258,15 +1268,29 @@ impl WgpuRenderer {
             .create_view(&wgpu::TextureViewDescriptor::default());
         let premultiplied_alpha =
             self.surface_config.alpha_mode == wgpu::CompositeAlphaMode::PreMultiplied;
-        if let Err(error) = core.render_frame(
+        let submission = match core.render_frame(
             scene,
             &frame_view,
             size,
             premultiplied_alpha,
             wgpu::Color::TRANSPARENT,
         ) {
-            log::error!("{error:#}");
-            return false;
+            Ok(submission) => submission,
+            Err(error) => {
+                log::error!("{error:#}");
+                return false;
+            }
+        };
+
+        const NVIDIA_VENDOR_ID: u32 = 0x10de;
+        if self.presents_through_xwayland
+            && core.adapter_info.vendor == NVIDIA_VENDOR_ID
+            && let Err(error) = core.resources.device.poll(wgpu::PollType::Wait {
+                submission_index: Some(submission),
+                timeout: Some(std::time::Duration::from_millis(100)),
+            })
+        {
+            log::warn!("Waiting for the frame before presenting it failed: {error:?}");
         }
 
         core.resources.queue.present(frame);
@@ -2360,6 +2384,7 @@ impl WgpuRenderer {
         self.atlas.handle_device_lost(context);
 
         let is_bgr = self.is_bgr;
+        let presents_through_xwayland = self.presents_through_xwayland;
         *self = Self::new_internal(
             Some(gpu_context.clone()),
             context,
@@ -2370,6 +2395,7 @@ impl WgpuRenderer {
             self.atlas.clone(),
         )?;
         self.set_subpixel_layout(is_bgr);
+        self.set_presents_through_xwayland(presents_through_xwayland);
 
         log::info!("GPU recovery complete");
         Ok(())

@@ -882,6 +882,12 @@ impl X11WindowState {
             };
 
             renderer.set_subpixel_layout(is_bgr);
+            renderer.set_presents_through_xwayland(
+                xcb.extension_information("XWAYLAND")
+                    .log_err()
+                    .flatten()
+                    .is_some(),
+            );
 
             // Set max window size hints based on the GPU's maximum texture dimension.
             // This prevents the window from being resized larger than what the GPU can render.
