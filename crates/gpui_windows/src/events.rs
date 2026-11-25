@@ -1086,6 +1086,34 @@ impl WindowsWindowInner {
         // We need to calculate the frame thickness ourselves and do the hit test manually.
         let frame_y = get_frame_thicknessx(dpi);
         let frame_x = get_frame_thicknessy(dpi);
+        // Ghostex: a resizable pop-up (`WS_POPUP` without `WS_THICKFRAME`) has no sizing border
+        // for `DefWindowProcW` to find on any side, so the top band below was its only resize
+        // edge: Ghostex's Live page window on Windows could not be resized from its bottom, left
+        // or right. Such a window now resizes from every edge and corner, measured inside its
+        // client area; a window with a sizing border keeps the system's edges and the top band.
+        if self.is_resizable
+            && !self.state.is_maximized()
+            && unsafe { GetWindowLongW(handle, GWL_STYLE) } as u32 & WS_THICKFRAME.0 == 0
+        {
+            let mut client = RECT::default();
+            unsafe { GetClientRect(handle, &mut client) }.log_err();
+            let top = cursor_point.y < frame_y;
+            let bottom = cursor_point.y >= client.bottom - frame_y;
+            let left = cursor_point.x < frame_x;
+            let right = cursor_point.x >= client.right - frame_x;
+            let edge = match (top, bottom, left, right) {
+                (true, _, true, _) => HTTOPLEFT,
+                (true, _, _, true) => HTTOPRIGHT,
+                (_, true, true, _) => HTBOTTOMLEFT,
+                (_, true, _, true) => HTBOTTOMRIGHT,
+                (true, ..) => HTTOP,
+                (_, true, ..) => HTBOTTOM,
+                (_, _, true, _) => HTLEFT,
+                (_, _, _, true) => HTRIGHT,
+                _ => return drag_area,
+            };
+            return Some(edge as _);
+        }
         if self.is_resizable
             && !self.state.is_maximized()
             && 0 <= cursor_point.y
