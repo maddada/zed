@@ -156,6 +156,8 @@ pub struct WindowsWindowState {
     pub(crate) draw_coordinator: Rc<DrawCoordinator>,
     fullscreen: Cell<Option<StyleAndBounds>>,
     initial_placement: Cell<Option<WindowOpenStatus>>,
+    /// Ghostex: the bounds last read while the window existed (`calculate_window_bounds`).
+    last_window_bounds: Cell<Option<(Bounds<Pixels>, bool)>>,
     hwnd: HWND,
     pub(crate) a11y: RefCell<Option<A11yState>>,
     pub mouse_position: Cell<Point<Pixels>>,
@@ -261,6 +263,7 @@ impl WindowsWindowState {
             display: Cell::new(display),
             fullscreen: Cell::new(fullscreen),
             initial_placement: Cell::new(initial_placement),
+            last_window_bounds: Cell::new(None),
             hwnd,
             invalidate_devices,
             draw_coordinator,
@@ -288,25 +291,36 @@ impl WindowsWindowState {
     }
 
     // Calculate the bounds used for saving and whether the window is maximized.
+    //
+    // Ghostex: a window that is already destroyed reports the bounds it last had. Closing a window
+    // deactivates it inside `DestroyWindow`, and the deactivation reaches GPUI afterwards
+    // (`handle_activate_msg` runs it on the executor), where every activation change re-reads the
+    // bounds. The placement of a destroyed window cannot be read, and its zeroed rect less the
+    // borders came out as a negative size, which apps then saved as where the window was: Ghostex
+    // reopened at its minimum size in the screen's corner after every close (Ghostex #753).
     fn calculate_window_bounds(&self) -> (Bounds<Pixels>, bool) {
-        let placement = unsafe {
-            let mut placement = WINDOWPLACEMENT {
-                length: std::mem::size_of::<WINDOWPLACEMENT>() as u32,
-                ..Default::default()
-            };
-            GetWindowPlacement(self.hwnd, &mut placement)
-                .context("failed to get window placement")
-                .log_err();
-            placement
+        let mut placement = WINDOWPLACEMENT {
+            length: std::mem::size_of::<WINDOWPLACEMENT>() as u32,
+            ..Default::default()
         };
-        (
+        if unsafe { GetWindowPlacement(self.hwnd, &mut placement) }
+            .context("failed to get window placement")
+            .log_err()
+            .is_none()
+            && let Some(last) = self.last_window_bounds.get()
+        {
+            return last;
+        }
+        let bounds = (
             calculate_client_rect(
                 placement.rcNormalPosition,
                 &self.border_offset,
                 self.scale_factor.get(),
             ),
             placement.showCmd == SW_SHOWMAXIMIZED.0 as u32,
-        )
+        );
+        self.last_window_bounds.set(Some(bounds));
+        bounds
     }
 
     fn window_bounds(&self) -> WindowBounds {
